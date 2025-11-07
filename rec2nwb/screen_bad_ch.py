@@ -5,10 +5,10 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from spikeinterface import extractors as se
-import os
 import shutil
 import re
 from rec2nwb.preproc_func import get_or_set_device_type, get_animal_id
+from spikesorting.ss_proc_func import get_sortout_folder
 
 
 def get_ch_index_on_shank(ish: int, device_type: str) -> tuple:
@@ -192,7 +192,8 @@ class BadChannelScreener:
 
         # Derive animal_id and session_id from folder structure
         session_id = self.get_session_description(data_folder)
-        out_root = Path("sortout") / animal_id / session_id
+        sortoutfolder = get_sortout_folder()
+        out_root = sortoutfolder / animal_id / session_id
 
         # Load recording
         print("Loading recording...")

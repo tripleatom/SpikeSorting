@@ -13,6 +13,7 @@ from Timer import Timer
 from rec2nwb.preproc_func import rm_artifacts, parse_session_info
 from spikesorting.ss_proc_func import get_sortout_folder
 
+
 def main(rec_folder, threshold=5.5, scheme=1, shanks=[0]):
     # Define recording folder and parse session info
     rec_folder = Path(rec_folder)
@@ -49,7 +50,6 @@ def main(rec_folder, threshold=5.5, scheme=1, shanks=[0]):
         # Apply common reference and whitening
         rec_cr = sp.common_reference(
             rec_rm_artifacts, reference="global", operator="median")
-        # rec_whiten = sp.whiten(rec_cr, dtype="float32")
         recording_preprocessed: si.BaseRecording = sp.whiten(rec_cr)
 
         # Define sorting parameters

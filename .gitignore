@@ -4,3 +4,4 @@ build
 *.ipynb
 .DS_Store
 *.json
+*.egg-info
