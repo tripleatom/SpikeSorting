@@ -14,10 +14,10 @@ from rec2nwb.preproc_func import rm_artifacts, parse_session_info
 from spikesorting.ss_proc_func import get_sortout_folder
 
 
-def main(rec_folder, threshold=5.5, scheme=1, shanks=[0]):
+def main(rec_folder, threshold=5.5, scheme=1, shanks=[0], animal_id=""):
     # Define recording folder and parse session info
     rec_folder = Path(rec_folder)
-    animal_id, session_id, folder_name = parse_session_info(str(rec_folder))
+    _, session_id, folder_name = parse_session_info(str(rec_folder))
 
     sortout = get_sortout_folder()
     for shank in shanks:
@@ -152,12 +152,13 @@ def process_from_json(json_file="sorting_files.json"):
         rec_folder = Path(rec['path'])
         shanks = rec['shanks']
         scheme = rec.get('scheme', 1)
+        animal_id = rec.get('animal_id')
 
         print(f"\n[{i}/{len(config['recordings'])}] Processing: {rec_folder.name}")
         print(f"  Shanks: {shanks}")
 
         # Call your main function
-        main(threshold=threshold, rec_folder=rec_folder,
+        main(threshold=threshold, rec_folder=rec_folder, animal_id=animal_id,
              shanks=shanks, scheme=scheme)
 
 
