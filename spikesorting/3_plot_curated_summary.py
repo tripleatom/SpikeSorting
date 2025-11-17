@@ -8,24 +8,21 @@ from spikeinterface.extractors import PhySortingExtractor
 import numpy as np
 import spikeinterface.preprocessing as sp
 import spikeinterface.widgets as sw
-
+from spikesorting.ss_proc_func import get_sortout_folder
 from rec2nwb.preproc_func import parse_session_info
+
+
+#FIXME: problematic code, didn't change according to data refactoring
 
 # Constants
 # BASE_FOLDER = r"\\10.129.151.108\xieluanlabs\xl_spinal_cord_electrode\CoI"
-<<<<<<< HEAD
 BASE_FOLDER = r"\\10.129.151.108\xieluanlabs\xl_cl\rf_reconstruction\head_fixed"  
 DATES = ['250912']
 # ANIMAL_IDS = ['CoI06', 'CoI07', 'CoI08', 'CoI09', 'CoI10']
 ANIMAL_IDS = [ 'CnL38', 'CnL39']
-=======
-BASE_FOLDER = r"C:\Users\alber\OneDrive\Desktop\Rice\Luan Lab\Continuous Learning"  
-DATES = ['250817']
-# ANIMAL_IDS = ['CoI06', 'CoI07', 'CoI08', 'CoI09', 'CoI10']
-ANIMAL_IDS = ['CnL22SG']
->>>>>>> 5d6772941a5f9828e55d3d013f581bdc548ba2b7
+
 ISHS = [0, 1, 2, 3]
-SORTOUT_FOLDER = Path(__file__).parents[1] / 'sortout'
+SORTOUT_FOLDER = get_sortout_folder()
 overwrite = False
 
 for date in DATES:
