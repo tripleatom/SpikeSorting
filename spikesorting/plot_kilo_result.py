@@ -8,7 +8,7 @@ import numpy as np
 import spikeinterface.widgets as sw
 from matplotlib import pyplot as plt
 
-shank = [6,7]
+shank = [0,2]
 
 for shank in shank:
     phy_folder = rf"C:\Users\xz106\data\kilosort\sh{shank}\kilosort4"
@@ -41,11 +41,12 @@ for shank in shank:
     _ = sorting_analyzer.compute('isi_histograms')
 
 #%%
+
     out_fig_folder = rf"C:\Users\xz106\data\kilosort\sh{shank}\unit"
     out_fig_folder = Path(out_fig_folder)
     out_fig_folder.mkdir(parents=True, exist_ok=True)
 
     for unit_id in sorting.get_unit_ids():
-        fig = sw.plot_unit_waveforms(sorting_analyzer, unit_id=unit_id, max_spikes=500)
-        fig.savefig(out_fig_folder / f"unit_{unit_id}_waveforms.png")
-        plt.close(fig)
+        sw.plot_unit_summary(sorting_analyzer, unit_id=unit_id)
+        plt.savefig(out_fig_folder / f"unit_{unit_id}_summary.png")
+        plt.close()

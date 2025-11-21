@@ -15,18 +15,20 @@ import shutil
 
 
 class EphysToNWBConverter:
-    """Unified converter for Intan and SpikeGadgets data to NWB format."""
+    """Unified converter for Intan and SpikeGadgets data to NWB format with optimized memory handling."""
     
-    def __init__(self, recording_method: str):
+    def __init__(self, recording_method: str, chunk_duration: float = 60.0):
         """
         Initialize converter with recording method.
         
         Args:
             recording_method: Either 'intan' or 'spikegadget'
+            chunk_duration: Duration in seconds for each chunk when processing large files (default: 60s)
         """
         if recording_method not in ['intan', 'spikegadget']:
             raise ValueError("Recording method must be 'intan' or 'spikegadget'")
         self.recording_method = recording_method
+        self.chunk_duration = chunk_duration
     
     def get_stream_ids(self, file_path: str) -> any:
         """
@@ -98,38 +100,84 @@ class EphysToNWBConverter:
         shutil.copy2(params_path, mda_folder)
         shutil.copy2(geom_path, mda_folder / "geom.csv")  # Always copy as geom.csv
 
-    def _read_recording(self, data_file: Path, channel_ids: list = None, selected_geom: Path = None):
-        """Read recording data based on recording method."""
+    def _get_recording_info(self, data_file: Path, selected_geom: Path = None):
+        """
+        Get recording object and metadata without loading all data.
+        Returns: recording object, sampling frequency, number of frames, conversion, offset
+        """
         if self.recording_method == 'intan':
             recording = se.read_intan(data_file, stream_id='0')
-            if channel_ids:
-                trace = recording.get_traces(channel_ids=channel_ids)
-            else:
-                trace = recording.get_traces()
             conversion = recording.get_channel_gains()[0] / 1e6
             offset = recording.get_channel_offsets()[0] / 1e6
         else:  # spikegadget
-            self._setup_spikegadget_files(data_file, selected_geom)  # Pass selected_geom
-        # rest remains the same...
+            self._setup_spikegadget_files(data_file, selected_geom)
             mda_folder = data_file.parent
             mda_file = data_file.name
             recording = se.read_mda_recording(mda_folder, mda_file, 
                                             params_fname="params.json",
                                             geom_fname="geom.csv")
-            if channel_ids:
-                trace = recording.get_traces(channel_ids=channel_ids)
-            else:
-                trace = recording.get_traces()
             conversion = 0.195 / 1e6  # Convert to V
             offset = 0.0 / 1e6
-            
-        return recording, trace, conversion, offset
+        
+        sampling_freq = recording.get_sampling_frequency()
+        num_frames = recording.get_num_frames()
+        
+        return recording, sampling_freq, num_frames, conversion, offset
+
+    def _read_recording_chunk(self, recording, channel_ids: list = None, 
+                             start_frame: int = 0, end_frame: int = None):
+        """
+        Read a chunk of recording data.
+        
+        Args:
+            recording: SpikeInterface recording object
+            channel_ids: List of channel IDs to read
+            start_frame: Starting frame for chunk
+            end_frame: Ending frame for chunk
+        """
+        if end_frame is None:
+            end_frame = recording.get_num_frames()
+        
+        if channel_ids:
+            trace = recording.get_traces(channel_ids=channel_ids, 
+                                        start_frame=start_frame, 
+                                        end_frame=end_frame)
+        else:
+            trace = recording.get_traces(start_frame=start_frame, 
+                                        end_frame=end_frame)
+        
+        return trace
+
+    def _estimate_file_size_gb(self, num_frames: int, num_channels: int, dtype_size: int = 2):
+        """
+        Estimate file size in GB.
+        
+        Args:
+            num_frames: Number of time frames
+            num_channels: Number of channels
+            dtype_size: Size of data type in bytes (default: 2 for int16)
+        """
+        total_bytes = num_frames * num_channels * dtype_size
+        return total_bytes / (1024**3)
+
+    def _should_use_chunked_processing(self, num_frames: int, num_channels: int, 
+                                      threshold_gb: float = 3.0):
+        """
+        Determine if chunked processing should be used based on estimated data size.
+        
+        Args:
+            num_frames: Number of time frames
+            num_channels: Number of channels
+            threshold_gb: Size threshold in GB for using chunked processing (default: 3.0)
+        """
+        estimated_size = self._estimate_file_size_gb(num_frames, num_channels)
+        return estimated_size > threshold_gb
 
     def initiate_nwb(self, data_file: Path, nwb_path: Path, ishank: int = 0,
                      impedance_path: str = None, bad_ch_ids: list = None,
                      metadata: dict = None) -> list:
         """
-        Create and write an NWB file from recording data.
+        Create and write an NWB file from recording data with optimized memory handling.
         """
         metadata = metadata or {}
         print("Initiating NWB file...")
@@ -144,6 +192,7 @@ class EphysToNWBConverter:
         electrode_location = metadata.get("electrode_location", None)
         device_type = metadata.get("device_type", "4shank16intan" if self.recording_method == 'intan' else "4shank16")
         selected_geom = metadata.get("selected_geom", None)
+        
         nwbfile = NWBFile(
             session_description=nwb_description,
             identifier=str(uuid4()),
@@ -216,29 +265,95 @@ class EphysToNWBConverter:
             list(range(n_electrodes)), "all electrodes"
         )
 
-        # Read recording data
-        print("Adding electrical data...")
+        # Get recording info
+        print("Getting recording information...")
+        recording, sampling_freq, num_frames, conversion, offset = self._get_recording_info(
+            data_file, selected_geom)
+        
+        # Determine channel IDs to use
         if impedance_path is not None:
-            recording, trace, conversion, offset = self._read_recording(
-                data_file, electrode_df['channel_name'].tolist(), selected_geom)
             good_channel_ids = electrode_df['channel_name'].tolist()
         else:
             if self.recording_method == 'intan':
                 good_channel_ids = electrode_df['channel_name'].tolist()
             else:
                 good_channel_ids = electrode_df['channel_index'].tolist()
-            recording, trace, conversion, offset = self._read_recording(
-                data_file, good_channel_ids, selected_geom)  # Add selected_geom here
-        electrical_series = ElectricalSeries(
-            name="ElectricalSeries",
-            data=H5DataIO(data=trace, maxshape=(None, trace.shape[1])),
-            electrodes=electrode_table_region,
-            starting_time=0.0,
-            rate=recording.get_sampling_frequency(),
-            conversion=conversion,
-            offset=offset,
-        )
-        nwbfile.add_acquisition(electrical_series)
+
+        # Check if chunked processing is needed
+        use_chunked = self._should_use_chunked_processing(num_frames, n_electrodes)
+        estimated_size = self._estimate_file_size_gb(num_frames, n_electrodes)
+        
+        print(f"File size: ~{estimated_size:.2f} GB")
+        print(f"Duration: {num_frames / sampling_freq:.2f} seconds")
+        print(f"Processing mode: {'Chunked' if use_chunked else 'Direct'}")
+
+        # Read and write electrical data
+        print("Adding electrical data...")
+        
+        if use_chunked:
+            # Process in chunks
+            chunk_frames = int(self.chunk_duration * sampling_freq)
+            num_chunks = int(np.ceil(num_frames / chunk_frames))
+            
+            print(f"Processing {num_chunks} chunks of {self.chunk_duration}s each...")
+            
+            # Read first chunk to initialize
+            first_chunk = self._read_recording_chunk(
+                recording, good_channel_ids, 0, min(chunk_frames, num_frames))
+            
+            electrical_series = ElectricalSeries(
+                name="ElectricalSeries",
+                data=H5DataIO(data=first_chunk, maxshape=(None, first_chunk.shape[1]),
+                             compression='gzip', compression_opts=4),
+                electrodes=electrode_table_region,
+                starting_time=0.0,
+                rate=sampling_freq,
+                conversion=conversion,
+                offset=offset,
+            )
+            nwbfile.add_acquisition(electrical_series)
+            
+            # Write initial NWB file
+            print(f"Writing chunk 1/{num_chunks}...")
+            with NWBHDF5IO(nwb_path, "w") as io:
+                io.write(nwbfile)
+            
+            # Append remaining chunks
+            for i in range(1, num_chunks):
+                start_frame = i * chunk_frames
+                end_frame = min((i + 1) * chunk_frames, num_frames)
+                
+                print(f"Processing chunk {i+1}/{num_chunks} (frames {start_frame}-{end_frame})...")
+                chunk_data = self._read_recording_chunk(
+                    recording, good_channel_ids, start_frame, end_frame)
+                
+                # Append to NWB file
+                with NWBHDF5IO(nwb_path, "a") as io:
+                    nwb_obj = io.read()
+                    self._append_nwb_dset(
+                        nwb_obj.acquisition['ElectricalSeries'].data, chunk_data, 0)
+                    io.write(nwb_obj)
+                
+                # Clean up
+                del chunk_data
+        else:
+            # Direct processing for smaller files
+            trace = self._read_recording_chunk(recording, good_channel_ids)
+            
+            electrical_series = ElectricalSeries(
+                name="ElectricalSeries",
+                data=H5DataIO(data=trace, maxshape=(None, trace.shape[1])),
+                electrodes=electrode_table_region,
+                starting_time=0.0,
+                rate=sampling_freq,
+                conversion=conversion,
+                offset=offset,
+            )
+            nwbfile.add_acquisition(electrical_series)
+            
+            print("Writing NWB file...")
+            with NWBHDF5IO(nwb_path, "w") as io:
+                io.write(nwbfile)
 
         # Handle digital input for Intan
         if self.recording_method == 'intan':
@@ -247,10 +362,6 @@ class EphysToNWBConverter:
                 print("Found digital input channels...")
                 # TODO: Implement digital input handling if needed
                 pass
-
-        print("Writing NWB file...")
-        with NWBHDF5IO(nwb_path, "w") as io:
-            io.write(nwbfile)
 
         return good_channel_ids
 
@@ -273,21 +384,57 @@ class EphysToNWBConverter:
     def append_nwb(self, nwb_path: Path, data_file: Path, channel_ids: list = None,
                    metadata: dict = None) -> None:
         """
-        Append additional recording data to an existing NWB file.
+        Append additional recording data to an existing NWB file with optimized memory handling.
         """
         metadata = metadata or {}
         selected_geom = metadata.get("selected_geom", None)
-        with NWBHDF5IO(nwb_path, "a") as io:
-            nwb_obj = io.read()
-            _, trace, _, _ = self._read_recording(data_file, channel_ids, selected_geom)
-            self._append_nwb_dset(
-                nwb_obj.acquisition['ElectricalSeries'].data, trace, 0)
-            io.write(nwb_obj)
+        
+        # Get recording info
+        recording, sampling_freq, num_frames, conversion, offset = self._get_recording_info(
+            data_file, selected_geom)
+        
+        # Check if chunked processing is needed
+        n_channels = len(channel_ids) if channel_ids else recording.get_num_channels()
+        use_chunked = self._should_use_chunked_processing(num_frames, n_channels)
+        estimated_size = self._estimate_file_size_gb(num_frames, n_channels)
+        
+        print(f"Appending file size: ~{estimated_size:.2f} GB")
+        print(f"Processing mode: {'Chunked' if use_chunked else 'Direct'}")
+        
+        if use_chunked:
+            # Process in chunks
+            chunk_frames = int(self.chunk_duration * sampling_freq)
+            num_chunks = int(np.ceil(num_frames / chunk_frames))
+            
+            print(f"Appending {num_chunks} chunks...")
+            
+            for i in range(num_chunks):
+                start_frame = i * chunk_frames
+                end_frame = min((i + 1) * chunk_frames, num_frames)
+                
+                print(f"Appending chunk {i+1}/{num_chunks} (frames {start_frame}-{end_frame})...")
+                chunk_data = self._read_recording_chunk(
+                    recording, channel_ids, start_frame, end_frame)
+                
+                with NWBHDF5IO(nwb_path, "a") as io:
+                    nwb_obj = io.read()
+                    self._append_nwb_dset(
+                        nwb_obj.acquisition['ElectricalSeries'].data, chunk_data, 0)
+                    io.write(nwb_obj)
+                
+                del chunk_data
+        else:
+            # Direct processing
+            trace = self._read_recording_chunk(recording, channel_ids)
+            with NWBHDF5IO(nwb_path, "a") as io:
+                nwb_obj = io.read()
+                self._append_nwb_dset(
+                    nwb_obj.acquisition['ElectricalSeries'].data, trace, 0)
+                io.write(nwb_obj)
 
     def get_data_files(self, data_folder: Path) -> list:
         """Get list of data files based on recording method."""
         if self.recording_method == 'intan':
-            # unchanged
             data_files = sorted(
                 p for p in data_folder.iterdir()
                 if p.suffix.lower() in ('.rhd', '.rhs') and not p.name.startswith("._"))
@@ -366,8 +513,12 @@ def main():
         print("Invalid choice. Exiting.")
         sys.exit(1)
 
+    # Get chunk duration for large files
+    chunk_duration_input = input("Enter chunk duration in seconds for large files (default: 60): ").strip()
+    chunk_duration = float(chunk_duration_input) if chunk_duration_input else 60.0
+
     # Initialize converter
-    converter = EphysToNWBConverter(recording_method)
+    converter = EphysToNWBConverter(recording_method, chunk_duration=chunk_duration)
     
     # Get inputs
     data_folder = Path(input(folder_prompt).strip().strip("'").strip('"'))
@@ -427,7 +578,9 @@ def main():
     # Process each shank
     for ish in shanks:
         nwb_path = data_folder / f"{session_description}sh{ish}.nwb"
+        print(f"\n{'='*60}")
         print(f"Creating NWB file {nwb_path.name}")
+        print(f"{'='*60}")
 
         # Create the NWB from first file
         good_ch = converter.initiate_nwb(
@@ -449,8 +602,10 @@ def main():
             continue
 
         # Append the rest
-        for f in data_files[1:]:
-            print(f"Appending {f.name} → {nwb_path.name}")
+        for idx, f in enumerate(data_files[1:], 2):
+            print(f"\n{'-'*60}")
+            print(f"Appending file {idx}/{len(data_files)}: {f.name}")
+            print(f"{'-'*60}")
             converter.append_nwb(
                 nwb_path, f,
                 channel_ids=good_ch,
@@ -458,7 +613,9 @@ def main():
                           'selected_geom': selected_geom if recording_method == 'spikegadget' else None}
             )
 
+    print("\n" + "="*60)
     print("Conversion completed successfully!")
+    print("="*60)
 
 
 if __name__ == "__main__":
