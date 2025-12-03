@@ -175,9 +175,13 @@ class EphysToNWBConverter:
 
     def initiate_nwb(self, data_file: Path, nwb_path: Path, ishank: int = 0,
                      impedance_path: str = None, bad_ch_ids: list = None,
-                     metadata: dict = None) -> list:
+                     metadata: dict = None, has_multiple_files: bool = False) -> list:
         """
         Create and write an NWB file from recording data with optimized memory handling.
+        
+        Args:
+            has_multiple_files: If True, forces chunked dataset creation even for smaller files
+                               to allow appending additional files later
         """
         metadata = metadata or {}
         print("Initiating NWB file...")
@@ -283,6 +287,11 @@ class EphysToNWBConverter:
         use_chunked = self._should_use_chunked_processing(num_frames, n_electrodes)
         estimated_size = self._estimate_file_size_gb(num_frames, n_electrodes)
         
+        # Force chunking if multiple files need to be appended
+        if has_multiple_files and not use_chunked:
+            print("Multiple files detected - enabling chunked dataset for appending")
+            use_chunked = True
+        
         print(f"File size: ~{estimated_size:.2f} GB")
         print(f"Duration: {num_frames / sampling_freq:.2f} seconds")
         print(f"Processing mode: {'Chunked' if use_chunked else 'Direct'}")
@@ -304,13 +313,14 @@ class EphysToNWBConverter:
             electrical_series = ElectricalSeries(
                 name="ElectricalSeries",
                 data=H5DataIO(data=first_chunk, maxshape=(None, first_chunk.shape[1]),
-                             compression='gzip', compression_opts=4),
+                            compression='gzip', compression_opts=4, chunks=True),
                 electrodes=electrode_table_region,
                 starting_time=0.0,
                 rate=sampling_freq,
                 conversion=conversion,
                 offset=offset,
             )
+            
             nwbfile.add_acquisition(electrical_series)
             
             # Write initial NWB file
@@ -337,24 +347,25 @@ class EphysToNWBConverter:
                 # Clean up
                 del chunk_data
         else:
-            # Direct processing for smaller files
+            # Direct processing for smaller files (but still needs chunking if multiple files)
             trace = self._read_recording_chunk(recording, good_channel_ids)
             
             electrical_series = ElectricalSeries(
                 name="ElectricalSeries",
-                data=H5DataIO(data=trace, maxshape=(None, trace.shape[1])),
+                data=H5DataIO(data=trace, maxshape=(None, trace.shape[1]), chunks=True),
                 electrodes=electrode_table_region,
                 starting_time=0.0,
                 rate=sampling_freq,
                 conversion=conversion,
                 offset=offset,
             )
+            
             nwbfile.add_acquisition(electrical_series)
             
             print("Writing NWB file...")
             with NWBHDF5IO(nwb_path, "w") as io:
                 io.write(nwbfile)
-
+                
         # Handle digital input for Intan
         if self.recording_method == 'intan':
             stream_ids = self.get_stream_ids(data_file)
@@ -390,7 +401,7 @@ class EphysToNWBConverter:
         selected_geom = metadata.get("selected_geom", None)
         
         # Get recording info
-        recording, sampling_freq, num_frames, conversion, offset = self._get_recording_info(
+        recording, sampling_freq, num_frames, conversion, offset, timestamps = self._get_recording_info(
             data_file, selected_geom)
         
         # Check if chunked processing is needed
@@ -594,7 +605,8 @@ def main():
                 'electrode_location': electrode_location,
                 'exp_desc': exp_desc,
                 'selected_geom': selected_geom if recording_method == 'spikegadget' else None
-            }
+            },
+            has_multiple_files=(len(data_files) > 1)  # Add this flag
         )
 
         if len(data_files) == 1:

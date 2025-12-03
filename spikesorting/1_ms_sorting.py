@@ -195,6 +195,9 @@ def main(rec_folder, sorter_params=None, shanks=[0], animal_id=""):
                 max_num_snippets_per_training_batch=sorter_params.get('scheme2_max_num_snippets_per_training_batch', 200),
                 training_duration_sec=sorter_params.get('scheme2_training_duration_sec', 300),
                 training_recording_sampling_mode=sorter_params.get('scheme2_training_recording_sampling_mode', 'uniform'),
+                phase1_detect_threshold=sorter_params.get('scheme2_phase1_detect_threshold', 5.5),
+                phase1_npca_per_channel=sorter_params.get('scheme2_phase1_npca_per_channel', 3),
+                phase1_npca_per_subdivision=sorter_params.get('scheme2_phase1_npca_per_subdivision', 10),
             )
             sorting = ms5.sorting_scheme2(
                 recording=recording_preprocessed, 

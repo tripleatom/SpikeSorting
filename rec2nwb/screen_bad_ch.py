@@ -7,6 +7,7 @@ from pathlib import Path
 from spikeinterface import extractors as se
 import shutil
 import re
+import random
 from rec2nwb.preproc_func import get_or_set_device_type, get_animal_id
 from spikesorting.ss_proc_func import get_sortout_folder
 
@@ -26,6 +27,7 @@ def get_ch_index_on_shank(ish: int, device_type: str) -> tuple:
 
     ch_index = np.where(sh == ish)[0]
     return ch_index, xcoord[ch_index], ycoord[ch_index]
+
 def get_geom_files(geom_folder: Path) -> list:
     """Get list of available geom.csv files in the geom folder."""
     if not geom_folder.exists():
@@ -179,9 +181,13 @@ class BadChannelScreener:
 
     def manual_bad_ch_id(self, animal_id,  data_folder: Path, first_file: Path, n_shank: int, 
                         impedance_path: Path = None, device_type: str = "4shank16",
-                        selected_geom: Path = None) -> list:
+                        selected_geom: Path = None, n_segments: int = 10) -> list:
         """
-        Manually screen bad channels across shanks, saving segment screenshots.
+        Manually screen bad channels across shanks with RANDOM segment selection.
+        Continues until user presses 'Finish' button.
+        
+        Args:
+            n_segments: Number of random segments to generate for screening (default: 10)
         """
         bad_file = data_folder / "bad_channels.txt"
         if bad_file.exists():
@@ -261,19 +267,30 @@ class BadChannelScreener:
 
             segment_duration = 3   # seconds per segment
             n_samples_segment = int(segment_duration * fs)
-            screening_duration = min(30, trace.shape[0] / fs)  # Adapt to available data
-            total_samples = int(screening_duration * fs)
-            segment_starts = np.arange(0, min(total_samples, trace.shape[0]), n_samples_segment)
+            
+            # Calculate valid range for random sampling
+            max_start_sample = trace.shape[0] - n_samples_segment
+            
+            # Generate random segment start positions
+            segment_starts = sorted(random.sample(range(0, max_start_sample, int(fs)), 
+                                                 min(n_segments, max_start_sample // int(fs))))
 
-            print(f"Will screen {len(segment_starts)} segments of {segment_duration}s each")
+            print(f"Will screen {len(segment_starts)} RANDOM segments of {segment_duration}s each")
 
             shank_bad = set()
+            
+            # Flag to check if the loop should be exited
+            exit_loop = False
+            seg_idx = 0
 
-            for seg_idx, seg_start in enumerate(segment_starts):
+            # CONTINUOUS LOOP - only stops when finish button is pressed
+            while not exit_loop:
+                # Cycle through the random segments
+                seg_start = segment_starts[seg_idx % len(segment_starts)]
                 seg_end = min(seg_start + n_samples_segment, trace.shape[0])
                 time_axis = np.arange(seg_start, seg_end) / fs
 
-                print(f"Displaying segment {seg_idx+1}/{len(segment_starts)}: {seg_start/fs:.1f}-{seg_end/fs:.1f}s")
+                print(f"Displaying segment {seg_idx+1} (position {seg_idx % len(segment_starts) + 1}/{len(segment_starts)}): {seg_start/fs:.1f}-{seg_end/fs:.1f}s")
 
                 fig = plt.figure(figsize=(12, 8))
                 ax_anno = fig.add_axes([0.05, 0.1, 0.12, 0.8])  # Moved closer to main plot
@@ -328,20 +345,18 @@ class BadChannelScreener:
                 finish_button = Button(finish_ax, 'Finish')
                 finish_button.label.set_fontsize(10)
 
-                # Flag to check if the loop should be exited
-                exit_loop = {'flag': False}
-
                 def finish_callback(event):
+                    nonlocal exit_loop
                     print("Exiting screening loop.")
-                    exit_loop['flag'] = True
+                    exit_loop = True
                     plt.close(fig)
 
                 finish_button.on_clicked(finish_callback)
 
-                print(f"Reviewing shank {ishank}, segment {seg_start/fs:.1f}-{seg_end/fs:.1f}s.")
+                print(f"Reviewing shank {ishank}, segment {seg_start/fs:.1f}-{seg_end/fs:.1f}s. Press 'Finish' to exit.")
                 plt.show()
 
-                # Update bad set before checking if we should break
+                # Update bad set after reviewing
                 for cid, is_bad in seg_bad_flags.items():
                     if is_bad:
                         shank_bad.add(cid)
@@ -350,14 +365,13 @@ class BadChannelScreener:
 
                 # Save figure after closing
                 seg_label = f"{int(seg_start/fs)}-{int(seg_end/fs)}s"
-                img_path = out_folder / f"shank{ishank}_seg_{seg_label}.png"
+                img_path = out_folder / f"shank{ishank}_seg_{seg_label}_iter{seg_idx}.png"
                 fig.savefig(img_path, dpi=150)
                 print(f"Saved screening image to: {img_path}")
                 plt.close(fig)
 
-                # Check if the finish button was clicked
-                if exit_loop['flag']:
-                    break
+                # Increment segment index for next iteration
+                seg_idx += 1
 
             # Save bad channels for the current shank
             all_bad_ch_ids.extend(sorted(shank_bad))
@@ -436,6 +450,10 @@ def main():
     
     # Get number of shanks
     n_shank = int(input("Enter the number of shanks: ").strip())
+    
+    # Get number of random segments to generate
+    n_segments_input = input("Enter number of random segments to generate (default: 10): ").strip()
+    n_segments = int(n_segments_input) if n_segments_input else 10
 
     # Get data files
     try:
@@ -446,10 +464,11 @@ def main():
         print(f"Error: {e}")
         return
 
-    # Run screening (pass selected_geom)
+    # Run screening (pass selected_geom and n_segments)
     try:
         bad_channels = screener.manual_bad_ch_id(
-            animal_id, data_folder, first_file, n_shank, impedance_file, device_type, selected_geom)
+            animal_id, data_folder, first_file, n_shank, impedance_file, device_type, 
+            selected_geom, n_segments)
         print(f"Screening completed. Found {len(bad_channels)} bad channels total.")
     except Exception as e:
         print(f"Error during screening: {e}")
