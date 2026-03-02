@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import numpy as np
 import spikeinterface.preprocessing as spre
 import json
@@ -157,7 +158,7 @@ def get_bad_ch_id(rec, folder, ish, load_if_exists=True):
     return bad_ch_id
 
 
-def rm_artifacts(rec_filtered, folder, ish, threshold=6, chunk_time=0.05, overwrite=False):
+def rm_artifacts(rec_filtered, folder, ish, mode="cubic", threshold=6, chunk_time=0.05, overwrite=False):
     r"""
     Remove artifacts from the filtered recording.
 
@@ -183,31 +184,59 @@ def rm_artifacts(rec_filtered, folder, ish, threshold=6, chunk_time=0.05, overwr
     if not overwrite and os.path.exists(artifact_file):
         artifact_indices = np.load(artifact_file)
     else:
-        # Compute norm of traces per chunk and channel.
+        # Compute norm of traces per chunk and channel using batch reads.
+        # Read large batches (e.g. 10s) at once, then reshape into chunks
+        # to avoid thousands of tiny I/O calls.
+        batch_time = 10.0  # seconds per batch read
+        batch_size = int(batch_time * fs)
         norms = np.zeros((num_chunks, n_channels))
-        for i in range(num_chunks):
-            start = i * chunk_size
-            end = min((i + 1) * chunk_size, n_timepoints)
-            chunk = rec_filtered.get_traces(start_frame=start, end_frame=end, return_scaled=True)
-            norms[i] = np.linalg.norm(chunk, axis=0)
 
-        # Determine which chunks to discard based on threshold.
-        use_chunk = np.ones(num_chunks, dtype=bool)
-        for ch in range(n_channels):
-            vals = norms[:, ch]
-            mean_val = np.mean(vals)
-            std_val = np.std(vals)
-            # Identify chunks with high norm (artifacts)
-            artifact_chunks = np.where(vals > mean_val + threshold * std_val)[0]
+        n_batches = int(np.ceil(n_timepoints / batch_size))
+        bar_width = 40
+        for b in range(n_batches):
+            batch_start = b * batch_size
+            batch_end = min((b + 1) * batch_size, n_timepoints)
+            traces = rec_filtered.get_traces(
+                start_frame=batch_start, end_frame=batch_end, return_scaled=True)
 
-            # Avoid using artifact chunk and its neighbors.
-            if artifact_chunks.size > 0:
-                use_chunk[artifact_chunks] = False
-                use_chunk[artifact_chunks[artifact_chunks > 0] - 1] = False
-                use_chunk[artifact_chunks[artifact_chunks < num_chunks - 1] + 1] = False
+            # Figure out which chunks fall in this batch
+            chunk_idx_start = batch_start // chunk_size
+            n_samples_in_batch = batch_end - batch_start
+            n_chunks_in_batch = int(np.ceil(n_samples_in_batch / chunk_size))
 
-            print(f"For channel {ch}: mean={mean_val:.2f}, stdev={std_val:.2f}, "
-                  f"chunk size = {chunk_size}, n_artifacts = {len(artifact_chunks)}")
+            for c in range(n_chunks_in_batch):
+                local_start = c * chunk_size
+                local_end = min((c + 1) * chunk_size, n_samples_in_batch)
+                norms[chunk_idx_start + c] = np.linalg.norm(
+                    traces[local_start:local_end], axis=0)
+
+            # Progress bar
+            pct = (b + 1) / n_batches
+            filled = int(bar_width * pct)
+            bar = '#' * filled + '-' * (bar_width - filled)
+            sys.stdout.write(f"\r  Computing norms [{bar}] {pct*100:.0f}%")
+            sys.stdout.flush()
+        print()  # newline after progress bar
+
+        # Determine which chunks to discard based on threshold (vectorized).
+        means = np.mean(norms, axis=0)
+        stds = np.std(norms, axis=0)
+        artifact_mask = norms > means[np.newaxis, :] + threshold * stds[np.newaxis, :]
+        bad_chunks = np.any(artifact_mask, axis=1)
+
+        # Also mark neighbors of bad chunks
+        bad_indices = np.where(bad_chunks)[0]
+        use_chunk = ~bad_chunks
+        if bad_indices.size > 0:
+            use_chunk[bad_indices[bad_indices > 0] - 1] = False
+            use_chunk[bad_indices[bad_indices < num_chunks - 1] + 1] = False
+
+        # Summary
+        n_bad = int(np.sum(~use_chunk))
+        bad_duration = n_bad * chunk_time
+        total_duration = n_timepoints / fs
+        print(f"  Artifacts: {n_bad} chunks ({bad_duration:.2f}s / {total_duration:.1f}s, "
+              f"{bad_duration/total_duration*100:.2f}%)")
 
         # Convert chunk indices to timepoints.
         artifact_indices = np.where(~use_chunk)[0] * chunk_size
@@ -220,7 +249,7 @@ def rm_artifacts(rec_filtered, folder, ish, threshold=6, chunk_time=0.05, overwr
         # mode“zeros”, “linear”, “cubic”, “average”, “median”, default: “zeros”
         rec_rm_artifacts = spre.remove_artifacts(
             rec_filtered, list_triggers=artifact_indices, ms_before=0, ms_after=chunk_time_ms,
-            mode='linear'
+            mode=mode
         )
     else:
         rec_rm_artifacts = rec_filtered

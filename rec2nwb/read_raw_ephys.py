@@ -401,7 +401,7 @@ class EphysToNWBConverter:
         selected_geom = metadata.get("selected_geom", None)
         
         # Get recording info
-        recording, sampling_freq, num_frames, conversion, offset, timestamps = self._get_recording_info(
+        recording, sampling_freq, num_frames, conversion, offset = self._get_recording_info(
             data_file, selected_geom)
         
         # Check if chunked processing is needed
