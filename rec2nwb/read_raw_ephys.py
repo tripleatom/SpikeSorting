@@ -1,4 +1,5 @@
 import re
+import json
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
@@ -20,13 +21,13 @@ class EphysToNWBConverter:
     def __init__(self, recording_method: str, chunk_duration: float = 60.0):
         """
         Initialize converter with recording method.
-        
+
         Args:
-            recording_method: Either 'intan' or 'spikegadget'
+            recording_method: 'intan', 'spikegadget' (MDA files), or 'spikegadget_rec' (.rec files)
             chunk_duration: Duration in seconds for each chunk when processing large files (default: 60s)
         """
-        if recording_method not in ['intan', 'spikegadget']:
-            raise ValueError("Recording method must be 'intan' or 'spikegadget'")
+        if recording_method not in ['intan', 'spikegadget', 'spikegadget_rec']:
+            raise ValueError("Recording method must be 'intan', 'spikegadget', or 'spikegadget_rec'")
         self.recording_method = recording_method
         self.chunk_duration = chunk_duration
     
@@ -35,7 +36,7 @@ class EphysToNWBConverter:
         Get the stream ids from an Intan file.
         Only applies to Intan recordings.
         """
-        if self.recording_method != 'intan':
+        if self.recording_method not in ['intan']:
             return None
             
         file_path = str(file_path)
@@ -57,13 +58,13 @@ class EphysToNWBConverter:
                 rec_datetimestr = match.group(2)  # yymmdd_HHMMSS
                 return datetime.strptime(rec_datetimestr, "%y%m%d_%H%M%S")
         else:
-            # Expected format: contains _YYYYMMDD_HHMMSS
+            # Expected format: contains _YYYYMMDD_HHMMSS (both MDA and .rec)
             match = re.search(r"_(\d{8})_(\d{6})", file_path.name)
             if match:
                 date_str = match.group(1)
                 time_str = match.group(2)
                 return datetime.strptime(f"{date_str}{time_str}", "%Y%m%d%H%M%S")
-        
+
         raise ValueError("Filename does not match expected pattern.")
 
     def get_ch_index_on_shank(self, ish: int, device_type: str) -> tuple:
@@ -84,21 +85,29 @@ class EphysToNWBConverter:
 
     def _setup_spikegadget_files(self, data_file: Path, selected_geom: Path = None):
         """Setup required files for SpikeGadgets reading."""
-        if self.recording_method != 'spikegadget':
-            return
-            
-        mda_folder = data_file.parent
         script_dir = Path(__file__).resolve().parent
         params_path = script_dir / "params.json"
-        
-        # Use selected geom file or default
-        if selected_geom is None:
-            geom_path = script_dir / "geom.csv"
-        else:
-            geom_path = selected_geom
-        
-        shutil.copy2(params_path, mda_folder)
-        shutil.copy2(geom_path, mda_folder / "geom.csv")  # Always copy as geom.csv
+
+        if self.recording_method == 'spikegadget':
+            mda_folder = data_file.parent
+            # Use selected geom file or default
+            geom_path = selected_geom if selected_geom is not None else script_dir / "geom.csv"
+            shutil.copy2(params_path, mda_folder)
+            shutil.copy2(geom_path, mda_folder / "geom.csv")  # Always copy as geom.csv
+        elif self.recording_method == 'spikegadget_rec':
+            rec_folder = data_file.parent
+            shutil.copy2(params_path, rec_folder)
+
+    def _get_sampling_rate_from_params(self) -> float:
+        """Read sampling rate from params.json in the script directory."""
+        script_dir = Path(__file__).resolve().parent
+        params_file = script_dir / "params.json"
+        if params_file.exists():
+            with open(params_file, 'r') as f:
+                params = json.load(f)
+            return float(params.get("samplerate", 30000))
+        print(f"Warning: params.json not found in {script_dir}, using default rate 30000")
+        return 30000.0
 
     def _get_recording_info(self, data_file: Path, selected_geom: Path = None):
         """
@@ -109,26 +118,32 @@ class EphysToNWBConverter:
             recording = se.read_intan(data_file, stream_id='0')
             conversion = recording.get_channel_gains()[0] / 1e6
             offset = recording.get_channel_offsets()[0] / 1e6
-        else:  # spikegadget
+            sampling_freq = recording.get_sampling_frequency()
+        elif self.recording_method == 'spikegadget':  # MDA
             self._setup_spikegadget_files(data_file, selected_geom)
             mda_folder = data_file.parent
             mda_file = data_file.name
-            recording = se.read_mda_recording(mda_folder, mda_file, 
-                                            params_fname="params.json",
-                                            geom_fname="geom.csv")
+            recording = se.read_mda_recording(mda_folder, mda_file,
+                                              params_fname="params.json",
+                                              geom_fname="geom.csv")
             conversion = 0.195 / 1e6  # Convert to V
             offset = 0.0 / 1e6
-        
-        sampling_freq = recording.get_sampling_frequency()
+            sampling_freq = recording.get_sampling_frequency()
+        else:  # spikegadget_rec
+            self._setup_spikegadget_files(data_file)
+            recording = se.read_spikegadgets(data_file)
+            conversion = 0.195 / 1e6  # Convert to V
+            offset = 0.0 / 1e6
+            sampling_freq = self._get_sampling_rate_from_params()
+
         num_frames = recording.get_num_frames()
-        
         return recording, sampling_freq, num_frames, conversion, offset
 
-    def _read_recording_chunk(self, recording, channel_ids: list = None, 
-                             start_frame: int = 0, end_frame: int = None):
+    def _read_recording_chunk(self, recording, channel_ids: list = None,
+                              start_frame: int = 0, end_frame: int = None):
         """
         Read a chunk of recording data.
-        
+
         Args:
             recording: SpikeInterface recording object
             channel_ids: List of channel IDs to read
@@ -137,15 +152,19 @@ class EphysToNWBConverter:
         """
         if end_frame is None:
             end_frame = recording.get_num_frames()
-        
+
+        # spikegadget_rec uses string channel IDs internally
+        if self.recording_method == 'spikegadget_rec' and channel_ids:
+            channel_ids = [str(ch) for ch in channel_ids]
+
         if channel_ids:
-            trace = recording.get_traces(channel_ids=channel_ids, 
-                                        start_frame=start_frame, 
-                                        end_frame=end_frame)
+            trace = recording.get_traces(channel_ids=channel_ids,
+                                         start_frame=start_frame,
+                                         end_frame=end_frame)
         else:
-            trace = recording.get_traces(start_frame=start_frame, 
-                                        end_frame=end_frame)
-        
+            trace = recording.get_traces(start_frame=start_frame,
+                                         end_frame=end_frame)
+
         return trace
 
     def _estimate_file_size_gb(self, num_frames: int, num_channels: int, dtype_size: int = 2):
@@ -235,7 +254,11 @@ class EphysToNWBConverter:
             channel_name_sh = channel_name[channel_index]
         else:
             # Create default channel names and impedances
-            channel_name_sh = [f"ch{i}" for i in channel_index]
+            # spikegadget_rec identifies channels by numeric index strings
+            if self.recording_method == 'spikegadget_rec':
+                channel_name_sh = [f"{i}" for i in channel_index]
+            else:
+                channel_name_sh = [f"ch{i}" for i in channel_index]
             impedance_sh = [np.nan] * len(channel_index)
 
         # Create electrode DataFrame
@@ -275,13 +298,19 @@ class EphysToNWBConverter:
             data_file, selected_geom)
         
         # Determine channel IDs to use
-        if impedance_path is not None:
+        if self.recording_method == 'spikegadget_rec':
+            # Validate channel indices against what the recording actually contains
+            actual_channel_ids = recording.get_channel_ids()
+            good_channel_ids = []
+            for idx in electrode_df['channel_index'].tolist():
+                if str(idx) in actual_channel_ids:
+                    good_channel_ids.append(idx)
+                else:
+                    print(f"Warning: Channel index {idx} not found in recording")
+        elif impedance_path is not None or self.recording_method == 'intan':
             good_channel_ids = electrode_df['channel_name'].tolist()
-        else:
-            if self.recording_method == 'intan':
-                good_channel_ids = electrode_df['channel_name'].tolist()
-            else:
-                good_channel_ids = electrode_df['channel_index'].tolist()
+        else:  # spikegadget (MDA)
+            good_channel_ids = electrode_df['channel_index'].tolist()
 
         # Check if chunked processing is needed
         use_chunked = self._should_use_chunked_processing(num_frames, n_electrodes)
@@ -449,42 +478,44 @@ class EphysToNWBConverter:
             data_files = sorted(
                 p for p in data_folder.iterdir()
                 if p.suffix.lower() in ('.rhd', '.rhs') and not p.name.startswith("._"))
-        else:  # spikegadget / mountainsort
+            if not data_files:
+                raise FileNotFoundError("No .rhd/.rhs files found in the specified folder.")
+        elif self.recording_method == 'spikegadget':  # MDA
             ms_folders = list(data_folder.glob('*.mountainsort'))
             if not ms_folders:
                 raise FileNotFoundError("No .mountainsort folders found in the specified folder.")
-            
+
             # Base folder (no .part) → (0,0); .partN → (1,N)
             def part_key(f: Path):
                 m = re.search(r'\.part(\d+)\.mountainsort$', f.name)
                 return (1, int(m.group(1))) if m else (0, 0)
-            
+
             ms_folders.sort(key=part_key)
-            
+
             data_files = []
             for folder in ms_folders:
                 group_files = list(folder.glob('*group0.mda'))
                 data_files.extend(group_files)
-        
-        if not data_files:
-            file_types = ".rhd/.rhs" if self.recording_method == 'intan' else "group0.mda"
-            raise FileNotFoundError(f"No {file_types} files found in the specified folder.")
-        
+
+            if not data_files:
+                raise FileNotFoundError("No group0.mda files found in the specified folder.")
+        else:  # spikegadget_rec
+            rec_files = list(data_folder.glob('*.rec'))
+            if not rec_files:
+                raise FileNotFoundError("No .rec files found in the specified folder.")
+
+            # Base .rec file (no .partN) sorts first, then part2, part3, ...
+            def rec_part_key(f: Path):
+                m = re.search(r'\.part(\d+)\.rec$', f.name)
+                return (1, int(m.group(1))) if m else (0, 0)
+
+            data_files = sorted(rec_files, key=rec_part_key)
+
         return data_files
 
     def get_session_description(self, data_folder: Path) -> str:
         """Extract session description from folder path."""
-        if self.recording_method == 'spikegadget':
-            # For SpikeGadgets: extract from .rec folder
-            folder_str = str(data_folder)
-            pattern = r'[\\\/]([^\\\/]+)\.rec$'
-            match = re.search(pattern, folder_str)
-            if match:
-                return match.group(1)
-            return data_folder.stem
-        else:
-            # For Intan: use folder name
-            return data_folder.name
+        return data_folder.name
 
 
 def load_bad_ch(bad_file: Path) -> list:
@@ -511,15 +542,19 @@ def main():
     # Choose recording method
     print("Choose recording method:")
     print("1. Intan")
-    print("2. SpikeGadgets")
-    choice = input("Enter choice (1 or 2): ").strip()
-    
+    print("2. SpikeGadgets (MDA / .mountainsort)")
+    print("3. SpikeGadgets (.rec file)")
+    choice = input("Enter choice (1, 2, or 3): ").strip()
+
     if choice == '1':
         recording_method = 'intan'
         folder_prompt = "Please enter the full path to the Intan data folder: "
     elif choice == '2':
         recording_method = 'spikegadget'
-        folder_prompt = "Please enter the full path to the .rec folder: "
+        folder_prompt = "Please enter the full path to the MDA data folder: "
+    elif choice == '3':
+        recording_method = 'spikegadget_rec'
+        folder_prompt = "Please enter the full path to the folder containing .rec files: "
     else:
         print("Invalid choice. Exiting.")
         sys.exit(1)
@@ -542,20 +577,20 @@ def main():
     animal_id = get_animal_id(data_folder)
     device_type = get_or_set_device_type(animal_id)
 
-    # GEOM FILE SELECTION (only for SpikeGadgets)
+    # GEOM FILE SELECTION (only for SpikeGadgets MDA)
     selected_geom = None
     if recording_method == 'spikegadget':
         script_dir = Path(__file__).resolve().parent
         geom_folder = script_dir / "geom"
         geom_files = get_geom_files(geom_folder)
-        
+
         if not geom_files:
             print(f"Warning: No .csv files found in {geom_folder}. Will use default geom.csv if available.")
         else:
             print("\nAvailable geom files:")
             for idx, gfile in enumerate(geom_files, 1):
                 print(f"{idx}. {gfile.name}")
-            
+
             geom_choice = input("Select geom file (enter number): ").strip()
             try:
                 geom_idx = int(geom_choice) - 1
