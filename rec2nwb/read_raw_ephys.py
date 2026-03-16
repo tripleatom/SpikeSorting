@@ -321,7 +321,6 @@ class EphysToNWBConverter:
                                    "4shank16intan" if self.recording_method == 'intan' else "4shank16")
         electrode_location = metadata.get("electrode_location", None)
         selected_geom = metadata.get("selected_geom", None)
-        session_desc = metadata.get("session_desc", session_description)
         first_file = data_files[0]
 
         # --- Per-shank electrode setup ---
@@ -386,7 +385,6 @@ class EphysToNWBConverter:
                 setup = shank_setups[ish]
                 chunk_sh = chunk_all[:, setup['col_indices']]
                 nwbfile = make_nwbfile(session_start_time, metadata)
-                nwbfile.session_description = session_desc
                 electrode_table_region = add_electrodes_to_nwb(
                     nwbfile, setup['electrode_df'], ish, electrode_location)
                 nwbfile.add_acquisition(
