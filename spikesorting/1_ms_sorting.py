@@ -382,6 +382,7 @@ def _process_single_recording(rec, out_folder, sorter_params, folder_name, shank
     # Compute metrics
     try:
         print("\n=== Computing Waveforms and Metrics ===")
+        si.set_global_job_kwargs(n_jobs=-1, chunk_duration="1s", progress_bar=True)
         sorting_analyzer.compute(['random_spikes', 'waveforms', 'noise_levels'])
         sorting_analyzer.compute('templates')
         _ = sorting_analyzer.compute('template_similarity')
