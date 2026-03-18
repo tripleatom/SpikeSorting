@@ -5,9 +5,10 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import matplotlib.image as mpimg
 from matplotlib.widgets import Button
+import spikeinterface as si
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-sortout_folder = Path(r"\\10.129.151.108\xieluanlabs\xl_cl\sortout\CnL42SG\CnL42SG_20260304")
+sortout_folder = Path(r"\\10.129.151.108\xieluanlabs\xl_cl\sortout\CnL42SG\CnL42SG_20260310")
 output_json = sortout_folder / "unit_labels.json"
 
 
@@ -67,6 +68,95 @@ def label_units(units, labels, output_path):
         return labels
 
     state = {"idx": 0}
+    # Cache firing-rate metrics per recording so we don't reload the analyzer
+    # from disk for every unit.
+    fr_cache = {}
+
+    def get_firing_rate(rec_name, uid):
+        """Return firing rate (Hz) for this unit, or None if unavailable.
+
+        Uses only spike times and the sorter sampling frequency; does NOT rely
+        on having a recording object available.
+
+        Also prints diagnostic information to the terminal.
+        """
+        # Use per-recording cache
+        if rec_name not in fr_cache:
+            try:
+                rec_dir = sortout_folder / rec_name
+                print(f"[FR] Looking for sorting results in: {rec_dir}")
+                sorting_dirs = sorted(rec_dir.glob("sorting_results_*"))
+                if not sorting_dirs:
+                    print(f"[FR] No 'sorting_results_*' folders found for {rec_name}")
+                    return None
+                latest_sorting = sorting_dirs[-1]
+                analyzer_folder = latest_sorting / "sorting_analyzer"
+                print(f"[FR] Using analyzer folder: {analyzer_folder}")
+                if not analyzer_folder.is_dir():
+                    print(f"[FR] Analyzer folder does not exist: {analyzer_folder}")
+                    return None
+
+                # Load existing sorting analyzer created by the sorter
+                sa = si.load_sorting_analyzer(str(analyzer_folder))
+                sorting = sa.sorting
+
+                spike_counts = sorting.count_num_spikes_per_unit()
+                fs = sorting.get_sampling_frequency()
+                if fs is None or fs <= 0:
+                    print(f"[FR] Invalid sampling frequency for {rec_name}: {fs}")
+                    return None
+
+                # Estimate recording duration from spike times only
+                first_frame = None
+                last_frame = None
+                for unit_id in sorting.get_unit_ids():
+                    st = sorting.get_unit_spike_train(unit_id=unit_id)
+                    if st.size == 0:
+                        continue
+                    u_first = int(st[0])
+                    u_last = int(st[-1])
+                    first_frame = u_first if first_frame is None else min(first_frame, u_first)
+                    last_frame = u_last if last_frame is None else max(last_frame, u_last)
+
+                if first_frame is None or last_frame is None or last_frame <= first_frame:
+                    print(f"[FR] Could not infer duration from spike trains for {rec_name}")
+                    return None
+
+                duration_sec = float(last_frame - first_frame) / float(fs)
+                print(f"[FR] Estimated duration for {rec_name}: {duration_sec:.3f} s (from spike times)")
+                if duration_sec <= 0:
+                    print(f"[FR] Non-positive duration for {rec_name}, cannot compute FR")
+                    return None
+
+                unit_fr = {}
+                for unit_id, count in spike_counts.items():
+                    try:
+                        count_int = int(count)
+                    except Exception:
+                        print(f"[FR] Could not cast spike count for unit {unit_id}: {count}")
+                        continue
+                    rate_hz = count_int / duration_sec
+                    unit_fr[str(unit_id)] = rate_hz
+                print(f"[FR] Computed firing rates for {len(unit_fr)} units in {rec_name}")
+
+                fr_cache[rec_name] = unit_fr
+            except Exception as e:
+                print(f"[FR] Error while loading analyzer for {rec_name}: {e}")
+                fr_cache[rec_name] = {}
+
+        # Look up this particular unit
+        unit_map = fr_cache.get(rec_name, {})
+        fr = unit_map.get(str(uid))
+        if fr is None and isinstance(uid, str) and uid.isdigit():
+            fr = unit_map.get(str(int(uid)))
+        if fr is None:
+            print(f"[FR] No firing rate found for recording '{rec_name}', unit '{uid}'")
+        else:
+            try:
+                print(f"[FR] Firing rate for recording '{rec_name}', unit '{uid}': {float(fr):.3f} Hz")
+            except Exception:
+                print(f"[FR] Firing rate for recording '{rec_name}', unit '{uid}': {fr}")
+        return fr
 
     fig, ax = plt.subplots(figsize=(14, 9))
     plt.subplots_adjust(bottom=0.12)
@@ -77,8 +167,20 @@ def label_units(units, labels, output_path):
         img = mpimg.imread(str(img_path))
         ax.imshow(img)
         ax.set_axis_off()
+
+        # Try to load firing rate (Hz) for this unit from the existing
+        # spikeinterface SortingAnalyzer (no need to re-run sorting).
+        fr = get_firing_rate(rec_name, uid)
+        if fr is not None:
+            try:
+                fr_str = f"{float(fr):.2f} Hz"
+            except (TypeError, ValueError):
+                fr_str = "null"
+        else:
+            fr_str = "null"
+
         ax.set_title(
-            f"[{rec_name}]  unit {uid}    ({state['idx'] + 1}/{len(todo)})",
+            f"[{rec_name}]  unit {uid}    ({state['idx'] + 1}/{len(todo)})  —  FR: {fr_str}",
             fontsize=13,
         )
         fig.canvas.draw_idle()
