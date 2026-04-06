@@ -3,12 +3,17 @@ NWB file construction helpers: creating NWBFile objects, adding electrodes,
 building ElectricalSeries, and appending HDF5 datasets.
 """
 
+from contextlib import contextmanager
 from uuid import uuid4
+import h5py
 import numpy as np
 import pandas as pd
 from pynwb import NWBFile, NWBHDF5IO
 from pynwb.ecephys import ElectricalSeries
 from hdmf.backends.hdf5.h5_utils import H5DataIO
+
+# Path to the ElectricalSeries data dataset inside an NWB HDF5 file.
+_NWB_DSET_PATH = "acquisition/ElectricalSeries/data"
 
 
 # ---------------------------------------------------------------------------
@@ -111,3 +116,26 @@ def append_chunk_to_nwb(nwb_path, chunk_data) -> None:
         nwb_obj = io.read()
         append_nwb_dset(nwb_obj.acquisition['ElectricalSeries'].data, chunk_data)
         io.write(nwb_obj)
+
+
+@contextmanager
+def nwb_direct_writer(nwb_path):
+    """Keep the NWB HDF5 file open for the duration, yielding a fast append callable.
+
+    Avoids the per-chunk open / read-full-NWB-object / write / close overhead of
+    append_chunk_to_nwb.  The file is opened once with h5py and kept open until
+    the context exits.
+
+    Usage::
+
+        with nwb_direct_writer(path) as append_fn:
+            for chunk in chunk_generator:
+                append_fn(chunk)
+    """
+    with h5py.File(nwb_path, 'a') as f:
+        dset = f[_NWB_DSET_PATH]
+        def _append(chunk: np.ndarray) -> None:
+            old = dset.shape[0]
+            dset.resize(old + chunk.shape[0], axis=0)
+            dset[old:] = chunk
+        yield _append

@@ -1,36 +1,7 @@
-"""
-Expected data structure for spikegadget_rec mode
-=================================================
-
-When converting multiple sessions, point data_folder at the parent directory
-containing one or more session folders (each with a .rec extension):
-
-    data_folder/
-    ├── CnL42SG_passive_20260304_142720.rec/       <- session folder (date 1)
-    │   ├── CnL42SG_passive_20260304_142720.rec    <- base file (no part number)
-    │   ├── CnL42SG_passive_20260304_142720.part2.rec
-    │   └── CnL42SG_passive_20260304_142720.part3.rec
-    ├── CnL42SG_passive_20260305_091000.rec/       <- session folder (date 2)
-    │   ├── CnL42SG_passive_20260305_091000.rec
-    │   └── CnL42SG_passive_20260305_091000.part2.rec
-    └── bad_channels.txt                           <- optional
-
-All .rec files are collected across all session folders, then sorted by:
-  1. Recording datetime (parsed from filename: _YYYYMMDD_HHMMSS)
-  2. Part number (base file first, then part2, part3, ...)
-
-The sorted files are concatenated and written into a single NWB file per shank.
-
-Filename convention:
-  <AnimalID>_<OptionalTag>_<YYYYMMDD>_<HHMMSS>[.partN].rec
-  Example: CnL42SG_passive_20260304_142720.part2.rec
-"""
-
 import re
 import time
 from datetime import datetime
 from pathlib import Path
-from uuid import uuid4
 import sys
 import numpy as np
 import pandas as pd
@@ -39,10 +10,7 @@ import neo.rawio
 from pynwb import NWBHDF5IO
 
 from rec2nwb.preproc_func import get_or_set_device_type, get_animal_id
-from rec2nwb.utils.file_io import (
-    get_data_files, setup_spikegadget_files, get_sampling_rate_from_params,
-    load_bad_ch, get_geom_files,
-)
+from rec2nwb.utils.file_io import get_data_files, load_bad_ch
 from rec2nwb.utils.electrode import (
     get_ch_index_on_shank, build_electrode_df, resolve_good_channel_ids,
 )
@@ -53,15 +21,15 @@ from rec2nwb.utils.nwb_helpers import (
 
 
 class EphysToNWBConverter:
-    """Converts Intan and SpikeGadgets recordings to NWB format."""
+    """Converts Intan recordings to NWB format."""
 
-    VALID_METHODS = ('intan', 'spikegadget', 'spikegadget_rec')
+    VALID_METHODS = ('intan',)
 
     def __init__(self, recording_method: str, chunk_duration: float = 60.0,
                  parallelShank: bool = False):
         """
         Args:
-            recording_method: 'intan', 'spikegadget' (MDA), or 'spikegadget_rec' (.rec).
+            recording_method: 'intan'.
             chunk_duration: Seconds per chunk for large-file processing (default 60 s).
             parallelShank: If True, all shanks share one get_traces() call per chunk.
         """
@@ -82,68 +50,40 @@ class EphysToNWBConverter:
         return data_folder.name
 
     def get_stream_ids(self, file_path: Path):
-        """Return Intan stream IDs (None for non-Intan recordings)."""
-        if self.recording_method != 'intan':
-            return None
+        """Return Intan stream IDs."""
         reader = neo.rawio.IntanRawIO(filename=str(file_path))
         reader.parse_header()
         return reader.header['signal_streams']['id']
 
     def get_timestamp(self, file_path: Path) -> datetime:
         """Parse the recording start datetime from the filename."""
-        if self.recording_method == 'intan':
-            m = re.match(r"[a-zA-Z0-9_]+_([0-9]+_[0-9]+)\.rh(?:s|d)", file_path.name)
-            if m:
-                return datetime.strptime(m.group(1), "%y%m%d_%H%M%S")
-        else:
-            m = re.search(r"_(\d{8})_(\d{6})", file_path.name)
-            if m:
-                return datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
+        m = re.match(r"[a-zA-Z0-9_]+_([0-9]+_[0-9]+)\.rh(?:s|d)", file_path.name)
+        if m:
+            return datetime.strptime(m.group(1), "%y%m%d_%H%M%S")
         raise ValueError(f"Cannot parse timestamp from filename: {file_path.name}")
 
     # ------------------------------------------------------------------
     # Recording I/O
     # ------------------------------------------------------------------
 
-    def _get_recording_info(self, data_file: Path, selected_geom: Path = None):
+    def _get_recording_info(self, data_file: Path):
         """
         Open the recording file and return metadata without loading all data.
 
         Returns:
             (recording, sampling_freq, num_frames, conversion_V, offset_V)
         """
-        if self.recording_method == 'intan':
-            recording = se.read_intan(data_file, stream_id='0')
-            conversion = recording.get_channel_gains()[0] / 1e6
-            offset = recording.get_channel_offsets()[0] / 1e6
-            sampling_freq = recording.get_sampling_frequency()
-
-        elif self.recording_method == 'spikegadget':
-            setup_spikegadget_files(data_file, self.recording_method, selected_geom)
-            recording = se.read_mda_recording(
-                data_file.parent, data_file.name,
-                params_fname="params.json", geom_fname="geom.csv",
-            )
-            conversion, offset = 0.195 / 1e6, 0.0
-            sampling_freq = recording.get_sampling_frequency()
-
-        else:  # spikegadget_rec
-            setup_spikegadget_files(data_file, self.recording_method)
-            recording = se.read_spikegadgets(data_file)
-            conversion, offset = 0.195 / 1e6, 0.0
-            sampling_freq = get_sampling_rate_from_params()
-
+        recording = se.read_intan(data_file, stream_id='0')
+        conversion = recording.get_channel_gains()[0] / 1e6
+        offset = recording.get_channel_offsets()[0] / 1e6
+        sampling_freq = recording.get_sampling_frequency()
         return recording, sampling_freq, recording.get_num_frames(), conversion, offset
 
     def _read_chunk(self, recording, channel_ids: list = None,
                     start_frame: int = 0, end_frame: int = None):
-        """Read a slice of recording data, handling spikegadget_rec string IDs."""
+        """Read a slice of recording data."""
         if end_frame is None:
             end_frame = recording.get_num_frames()
-
-        if self.recording_method == 'spikegadget_rec' and channel_ids:
-            channel_ids = [str(ch) for ch in channel_ids]
-
         kwargs = dict(start_frame=start_frame, end_frame=end_frame)
         if channel_ids:
             kwargs['channel_ids'] = channel_ids
@@ -184,10 +124,8 @@ class EphysToNWBConverter:
             good_channel_ids used (needed for subsequent append_nwb calls).
         """
         metadata = metadata or {}
-        device_type = metadata.get("device_type",
-                                   "4shank16intan" if self.recording_method == 'intan' else "4shank16")
+        device_type = metadata.get("device_type", "4shank16intan")
         electrode_location = metadata.get("electrode_location", None)
-        selected_geom = metadata.get("selected_geom", None)
 
         print("Initiating NWB file...")
         session_start_time = self.get_timestamp(data_file)
@@ -204,7 +142,7 @@ class EphysToNWBConverter:
         # --- Recording info ---
         print("Getting recording information...")
         recording, sampling_freq, num_frames, conversion, offset = \
-            self._get_recording_info(data_file, selected_geom)
+            self._get_recording_info(data_file)
         self._last_sampling_freq = sampling_freq
 
         good_channel_ids = resolve_good_channel_ids(
@@ -262,22 +200,17 @@ class EphysToNWBConverter:
             with NWBHDF5IO(nwb_path, "w") as io:
                 io.write(nwbfile)
 
-        # Digital input (Intan only — placeholder)
-        if self.recording_method == 'intan':
-            stream_ids = self.get_stream_ids(data_file)
-            if stream_ids is not None and '4' in stream_ids:
-                print("Found digital input channels (not yet implemented).")
+        # Digital input
+        stream_ids = self.get_stream_ids(data_file)
+        if stream_ids is not None and '4' in stream_ids:
+            print("Found digital input channels (not yet implemented).")
 
         return good_channel_ids
 
     def append_nwb(self, nwb_path: Path, data_file: Path,
                    channel_ids: list = None, metadata: dict = None) -> None:
         """Append one more data file to an existing NWB file."""
-        metadata = metadata or {}
-        selected_geom = metadata.get("selected_geom", None)
-
-        recording, sampling_freq, num_frames, _, _ = \
-            self._get_recording_info(data_file, selected_geom)
+        recording, sampling_freq, num_frames, _, _ = self._get_recording_info(data_file)
         self._last_sampling_freq = sampling_freq
 
         n_channels = len(channel_ids) if channel_ids else recording.get_num_channels()
@@ -317,10 +250,8 @@ class EphysToNWBConverter:
             {shank_index: good_channel_ids}
         """
         metadata = metadata or {}
-        device_type = metadata.get("device_type",
-                                   "4shank16intan" if self.recording_method == 'intan' else "4shank16")
+        device_type = metadata.get("device_type", "4shank16intan")
         electrode_location = metadata.get("electrode_location", None)
-        selected_geom = metadata.get("selected_geom", None)
         first_file = data_files[0]
 
         # --- Per-shank electrode setup ---
@@ -351,12 +282,6 @@ class EphysToNWBConverter:
                     all_channel_ids.append(ch)
                     seen.add(str(ch))
 
-        get_traces_ids = (
-            [str(ch) for ch in all_channel_ids]
-            if self.recording_method == 'spikegadget_rec'
-            else all_channel_ids
-        )
-
         # Map each shank's channels to column positions in the combined array
         ch_to_col = {str(ch): i for i, ch in enumerate(all_channel_ids)}
         for ish in shanks:
@@ -367,7 +292,7 @@ class EphysToNWBConverter:
         # --- Recording info (once, from first file) ---
         print("\nGetting recording information...")
         recording, sampling_freq, num_frames, conversion, offset = \
-            self._get_recording_info(first_file, selected_geom)
+            self._get_recording_info(first_file)
         self._last_sampling_freq = sampling_freq
 
         chunk_frames = int(self.chunk_duration * sampling_freq)
@@ -405,7 +330,7 @@ class EphysToNWBConverter:
                 start = i * chunk_frames
                 end = min((i + 1) * chunk_frames, n_frames)
                 print(f"  Chunk {i+1}/{n} (frames {start}-{end}) — {label}")
-                chunk = rec.get_traces(channel_ids=get_traces_ids,
+                chunk = rec.get_traces(channel_ids=all_channel_ids,
                                        start_frame=start, end_frame=end)
                 yield chunk
                 del chunk
@@ -423,7 +348,7 @@ class EphysToNWBConverter:
         for file_idx, f in enumerate(data_files[1:], 2):
             print(f"\n{'='*60}\nProcessing file {file_idx}/{len(data_files)}: {f.name}\n{'='*60}")
             t0 = time.time()
-            rec2, _, num_frames2, _, _ = self._get_recording_info(f, selected_geom)
+            rec2, _, num_frames2, _, _ = self._get_recording_info(f)
             for chunk in _iter_chunks(rec2, num_frames2, f.name):
                 _append_to_all_shanks(chunk)
             print(f"File {file_idx}/{len(data_files)} done in {time.time()-t0:.1f}s")
@@ -436,35 +361,14 @@ class EphysToNWBConverter:
 # ---------------------------------------------------------------------------
 
 def main():
-    print("Choose recording method:")
-    print("1. Intan")
-    print("2. SpikeGadgets (MDA / .mountainsort)")
-    print("3. SpikeGadgets (.rec file)")
-    choice = input("Enter choice (1, 2, or 3): ").strip()
+    recording_method = 'intan'
+    converter = EphysToNWBConverter(
+        recording_method,
+        chunk_duration=float(input("Chunk duration in seconds (default 60): ").strip() or 60.0),
+        parallelShank=input("Process all shanks in parallel per chunk? [y/N]: ").strip().lower() == 'y',
+    )
 
-    if choice == '1':
-        recording_method = 'intan'
-        folder_prompt = "Path to the Intan data folder: "
-    elif choice == '2':
-        recording_method = 'spikegadget'
-        folder_prompt = "Path to the MDA data folder: "
-    elif choice == '3':
-        recording_method = 'spikegadget_rec'
-        folder_prompt = "Path to the folder containing .rec files: "
-    else:
-        print("Invalid choice. Exiting.")
-        sys.exit(1)
-
-    chunk_input = input("Chunk duration in seconds (default 60): ").strip()
-    chunk_duration = float(chunk_input) if chunk_input else 60.0
-
-    parallel_shank = input("Process all shanks in parallel per chunk? [y/N]: ").strip().lower() == 'y'
-
-    converter = EphysToNWBConverter(recording_method,
-                                    chunk_duration=chunk_duration,
-                                    parallelShank=parallel_shank)
-
-    data_folder = Path(input(folder_prompt).strip().strip("'\""))
+    data_folder = Path(input("Path to the Intan data folder: ").strip().strip("'\""))
     if not data_folder.exists():
         print(f"Folder {data_folder} does not exist, exiting.")
         sys.exit(1)
@@ -476,27 +380,6 @@ def main():
 
     animal_id = get_animal_id(data_folder)
     device_type = get_or_set_device_type(animal_id)
-
-    # Geom file selection (SpikeGadgets MDA only)
-    selected_geom = None
-    if recording_method == 'spikegadget':
-        script_dir = Path(__file__).resolve().parent
-        geom_files = get_geom_files(script_dir / "geom")
-        if not geom_files:
-            print("Warning: no .csv files in geom folder, using default geom.csv.")
-        else:
-            print("\nAvailable geom files:")
-            for idx, gf in enumerate(geom_files, 1):
-                print(f"  {idx}. {gf.name}")
-            try:
-                geom_idx = int(input("Select geom file (number): ").strip()) - 1
-                if 0 <= geom_idx < len(geom_files):
-                    selected_geom = geom_files[geom_idx]
-                    print(f"Selected: {selected_geom.name}")
-                else:
-                    print("Invalid selection, using default.")
-            except ValueError:
-                print("Invalid input, using default.")
 
     raw = input("Shank numbers (e.g. 0,1,2,3 or [0,1,2,3]): ")
     shanks = [int(x) for x in re.findall(r'\d+', raw)]
@@ -513,7 +396,7 @@ def main():
     log_lines = [f"Conversion order ({len(data_files)} file(s)):"]
     for i, f in enumerate(data_files, 1):
         try:
-            rec = se.read_spikegadgets(str(f))
+            rec = se.read_intan(str(f), stream_id='0')
             line = f"  {i:2d}. {f.name}: {rec.get_num_frames()} timestamps"
         except Exception as e:
             line = f"  {i:2d}. {f.name}: ERROR — {e}"
@@ -532,7 +415,6 @@ def main():
         'session_desc': session_description,
         'electrode_location': electrode_location,
         'exp_desc': exp_desc,
-        'selected_geom': selected_geom if recording_method == 'spikegadget' else None,
     }
 
     t0 = time.time()
