@@ -60,17 +60,22 @@ sortout/
 
 | File | Description |
 | ---- | ----------- |
-| `read_raw_ephys.py` | Main converter: reads Intan or SpikeGadget recordings and writes per-shank NWB files |
-| `read_raw_ephys_parallel.py` | Parallel batch version of the above |
+| `intan2nwb.py` | Class-based Intan converter (`EphysToNWBConverter`): reads `.rhd`/`.rhs` files and writes per-shank NWB files; supports chunked writes and parallel-shank mode |
+| `rec2nwb_interp.py` | SpikeGadgets `.rec` converter with PCHIP interpolation across multi-part sessions; supports prefetch-based I/O overlap and DIO extraction |
+| `batch_rec2nwb.py` | Batch wrapper for `rec2nwb_interp.py`: reads `batch_config.json`, processes multiple folders sequentially, writes a timestamped run log |
 | `screen_bad_ch.py` | Interactive matplotlib GUI for reviewing traces and marking bad channels |
 | `preproc_func.py` | Utilities: animal ID detection, electrode probe selection, channel indexing |
 | `nwb2bin.py` | Converts NWB to binary format (`.bin`) for Kilosort input |
 | `trim_nwb.py` | Removes noisy/artifact time windows from an NWB file |
+| `add_txt.py` | Creates an empty `.txt` sidecar file next to each `.rec` file in a folder (required by SpikeGadgets reader) |
 | `load_mda.py` | Loads and visualizes raw SpikeGadget `.mda` data for inspection |
+| `batch_config.json` | Folder list and per-folder parameters for batch SpikeGadgets conversion |
 | `params.json` | Default recording parameters (`samplerate: 30000`, `spike_sign: -1`) |
 | `device_types.json` | Maps animal IDs to electrode probe types |
 | `mapping/` | Channel mapping CSV files for each supported probe configuration |
 | `geom/` | Electrode geometry CSV files |
+| `utils/` | Shared helpers: `file_io.py`, `electrode.py`, `nwb_helpers.py` |
+| `process_func/` | Recording-format-specific processing (e.g. `DIO.py` for digital input extraction) |
 
 ### `spikesorting/`
 
@@ -79,6 +84,8 @@ sortout/
 | `1_ms_sorting.py` | Mountainsort5 spike sorting: loads NWB(s), preprocesses, runs sorter |
 | `2_export_phy.py` | Exports sorting results to Phy format for manual curation |
 | `3_plot_curated_summary.py` | Generates summary plots for curated units |
+| `curation_lazy.py` | matplotlib GUI for rapid unit labeling: shows unit summary images one-by-one with Good / MUA / Noise buttons; caches firing rates from the SortingAnalyzer and saves labels to `unit_labels.json` |
+| `sort_kilo.py` | KiloSort4 runner that reads an NWB file in-memory via a lazy wrapper (no binary written to disk); selects the least-used GPU automatically |
 | `artifact_utils.py` | Per-channel artifact detection and removal |
 | `ss_proc_func.py` | Utilities: sortout folder selection |
 | `Timer.py` | Simple elapsed-time helper |
@@ -93,25 +100,30 @@ sortout/
 ```
 Raw data (.rhd / .rec)
         |
+        +-- Intan (.rhd/.rhs) ---------> rec2nwb/intan2nwb.py
+        |
+        +-- SpikeGadgets (.rec) -------> rec2nwb/rec2nwb_interp.py
+        |   (batch: batch_rec2nwb.py)     -> one NWB file per shank
+        |
         v
 [1] Screen bad channels        rec2nwb/screen_bad_ch.py
         |
         v
-[2] Convert to NWB             rec2nwb/read_raw_ephys.py
-        |                      -> one NWB file per shank
+[2] Convert to NWB             (see above)
+        |
         v
 [3] (Optional) Trim NWB        rec2nwb/trim_nwb.py
         |                      -> removes artifact epochs
         v
-[4] Spike sorting              spikesorting/1_ms_sorting.py
-        |                      -> CAR, bandpass 300-6000 Hz,
-        |                         artifact removal, Mountainsort5
+[4] Spike sorting              spikesorting/1_ms_sorting.py  (Mountainsort5)
+        |                   or spikesorting/sort_kilo.py      (KiloSort4)
+        |                      -> CAR, bandpass 300-6000 Hz, artifact removal
         v
 [5] Export to Phy              spikesorting/2_export_phy.py
         |
         v
 [6] Manual curation            Phy GUI (external)
-        |
+        |                   or spikesorting/curation_lazy.py  (quick GUI labeling)
         v
 [7] Plot curated summary       spikesorting/3_plot_curated_summary.py
 ```
@@ -132,17 +144,27 @@ On launch you will be prompted to select the recording folder and probe type.
 
 ### 2. Convert recording to NWB
 
-Edit the paths in `read_raw_ephys.py` or run it directly. It auto-detects the recording format (Intan vs SpikeGadget) and outputs one NWB file per shank.
+**Intan (`.rhd` / `.rhs`)** — run the interactive converter, which prompts for folder path, shanks, chunk size, and optionally processes all shanks in a single pass:
 
 ```bash
-python rec2nwb/read_raw_ephys.py
+python rec2nwb/intan2nwb.py
 ```
 
-For batch conversion of multiple recordings in parallel:
+**SpikeGadgets (`.rec`)** — single session:
 
 ```bash
-python rec2nwb/read_raw_ephys_parallel.py
+python rec2nwb/rec2nwb_interp.py
 ```
+
+**SpikeGadgets — batch** — edit `rec2nwb/batch_config.json` with the list of folders and parameters, then:
+
+```bash
+python rec2nwb/batch_rec2nwb.py
+```
+
+A timestamped log file (`batch_run_YYYYMMDD_HHMMSS.txt`) is written alongside the script.
+
+> **SpikeGadgets note:** some readers require a `.txt` sidecar next to each `.rec` file. Run `python rec2nwb/add_txt.py <folder>` to create them if missing.
 
 ### 3. (Optional) Trim noisy regions
 
@@ -152,12 +174,18 @@ Edit the time window in `trim_nwb.py` and run:
 python rec2nwb/trim_nwb.py
 ```
 
-### 4. Run Mountainsort5
+### 4. Run spike sorting
 
-Edit `spikesorting/sorting_files.json` to specify recordings, shanks, and sorter parameters, then:
+**Option A — Mountainsort5:** edit `spikesorting/sorting_files.json` to specify recordings, shanks, and sorter parameters, then:
 
 ```bash
 python spikesorting/1_ms_sorting.py
+```
+
+**Option B — KiloSort4:** set `nwb_path`, `sortout`, and `kilosort_params` at the top of the script, then run it as a notebook (`.py` with `#%%` cells) or plain script. Data is streamed directly from the NWB file with no intermediate binary:
+
+```bash
+python spikesorting/sort_kilo.py
 ```
 
 #### `sorting_files.json` — global parameters
@@ -213,7 +241,19 @@ Edit `spikesorting/phy_files.json` to point to the sorting output, then:
 python spikesorting/2_export_phy.py
 ```
 
-### 6. Plot curated summary
+### 6. Curate units
+
+**Option A — Phy GUI** (standard manual curation, external tool)
+
+**Option B — Lazy curation GUI** — review unit summary images directly in matplotlib without opening Phy. Set `sortout_folder` at the top of the script, then:
+
+```bash
+python spikesorting/curation_lazy.py
+```
+
+Click **Good**, **MUA**, or **Noise** for each unit. Labels are saved incrementally to `unit_labels.json` in the sortout folder. The firing rate (from the SortingAnalyzer) is shown in the title. Use **Back** / **Skip** to navigate. Already-labeled units are skipped on re-run.
+
+### 7. Plot curated summary
 
 After curation in Phy, generate per-unit summary plots:
 
@@ -229,7 +269,7 @@ Output PNGs are saved to `curated_units/` in the sort output folder.
 
 ### `rec2nwb/device_types.json`
 
-Maps animal IDs to probe configurations (auto-updated when you run `read_raw_ephys.py`):
+Maps animal IDs to probe configurations (auto-updated when you run the converter scripts):
 
 ```json
 {

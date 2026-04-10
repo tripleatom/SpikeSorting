@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import traceback
 from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
@@ -12,132 +13,71 @@ import mountainsort5 as ms5
 from Timer import Timer
 from rec2nwb.preproc_func import parse_session_info
 
-from spikesorting.artifact_utils import repair_artifacts_recording
+from spikesorting.artifact_utils import (detect_artifacts_recording,
+                                          LazyArtifactRepairRecording)
 
 
-def load_and_concatenate_recordings(nwb_files):
+def _load_or_compute_artifacts(rec, out_folder, sorter_params):
     """
-    Load multiple NWB files and concatenate them, tracking sample boundaries.
+    Return (rec_repaired, artifact_timestamps).
 
-    Parameters
-    ----------
-    nwb_files : list
-        List of paths to NWB files
-
-    Returns
-    -------
-    rec : BaseRecording
-        Concatenated recording
-    boundary_info : list of dict
-        List containing boundary information for each recording
+    On first run: detects artifacts (reads recording once), saves tiny per-channel
+    timestamp arrays to out_folder/_artifact_cache/ (a few KB total), then wraps
+    the recording in a LazyArtifactRepairRecording — no memmap, no disk write.
+    On subsequent runs: loads cached timestamps instantly and skips detection.
+    Cache is invalidated if detection params or recording shape changes.
     """
-    recordings = []
-    boundary_info = []
-    cumulative_samples = 0
+    cache_dir = Path(out_folder) / '_artifact_cache'
+    meta_path = cache_dir / 'cache_meta.json'
+    ts_path   = cache_dir / 'artifact_timestamps.npz'
 
-    print("\n=== Loading and Concatenating Recordings ===")
-    for i, nwb_file in enumerate(nwb_files):
-        nwb_path = Path(nwb_file)
-        print(f"\nLoading [{i+1}/{len(nwb_files)}]: {nwb_path.name}")
+    current_meta = {
+        'detection_method': 'rolling_std',
+        'rolling_window_size': 100,
+        'rolling_z_threshold': 30,
+        'time_batch_sec': sorter_params.get('artifact_time_batch_sec', 600),
+        'n_samples': int(rec.get_num_frames()),
+        'n_channels': int(rec.get_num_channels()),
+        'sampling_rate': float(rec.get_sampling_frequency()),
+    }
 
-        rec = se.NwbRecordingExtractor(str(nwb_path))
-        n_samples = rec.get_num_samples()
-        duration = rec.get_total_duration()
-        fs = rec.get_sampling_frequency()
-
-        info = {
-            'index': i,
-            'file': str(nwb_path),
-            'filename': nwb_path.name,
-            'sampling_rate': fs,
-            'n_samples': n_samples,
-            'duration_sec': duration,
-            'start_sample': cumulative_samples,
-            'end_sample': cumulative_samples + n_samples - 1,
-        }
-        boundary_info.append(info)
-
-        print(f"  Sampling rate: {fs} Hz")
-        print(f"  Samples: {n_samples:,}")
-        print(f"  Duration: {duration:.2f} sec")
-        print(f"  Sample range: {cumulative_samples:,} - {cumulative_samples + n_samples - 1:,}")
-
-        recordings.append(rec)
-        cumulative_samples += n_samples
-
-    # Concatenate all recordings
-    if len(recordings) == 1:
-        rec_concat = recordings[0]
+    if meta_path.exists() and ts_path.exists():
+        with open(meta_path) as f:
+            cached_meta = json.load(f)
+        if cached_meta == current_meta:
+            print("1. Cache hit — loading artifact timestamps, skipping detection...")
+            n_channels = current_meta['n_channels']
+            ts_data = np.load(str(ts_path), allow_pickle=True)
+            artifact_timestamps = [ts_data[f'ch_{i:03d}'] for i in range(n_channels)]
+        else:
+            print("1. Cache params mismatch — rerunning artifact detection...")
+            artifact_timestamps = None
     else:
-        rec_concat = si.concatenate_recordings(recordings)
+        print("1. No cache — running artifact detection and saving timestamps...")
+        artifact_timestamps = None
 
-    print(f"\n=== Concatenation Summary ===")
-    print(f"Total recordings: {len(recordings)}")
-    print(f"Total samples: {cumulative_samples:,}")
-    print(f"Total duration: {cumulative_samples / fs:.2f} sec")
+    if artifact_timestamps is None:
+        artifact_timestamps = detect_artifacts_recording(
+            rec,
+            detection_method=current_meta['detection_method'],
+            rolling_window_size=current_meta['rolling_window_size'],
+            rolling_z_threshold=current_meta['rolling_z_threshold'],
+            time_batch_sec=current_meta['time_batch_sec'],
+        )
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        with open(meta_path, 'w') as f:
+            json.dump(current_meta, f, indent=2)
+        ts_save = {f'ch_{i:03d}': ts for i, ts in enumerate(artifact_timestamps)}
+        np.savez(str(ts_path), **ts_save)
 
-    return rec_concat, boundary_info
-
-
-def save_boundary_info(boundary_info, output_folder, filename="recording_boundaries.txt"):
-    """
-    Save recording boundary information to a text file.
-
-    Parameters
-    ----------
-    boundary_info : list of dict
-        Boundary information from load_and_concatenate_recordings
-    output_folder : Path
-        Folder to save the file
-    filename : str
-        Output filename
-    """
-    output_path = Path(output_folder) / filename
-
-    with open(output_path, 'w') as f:
-        f.write("=" * 70 + "\n")
-        f.write("RECORDING BOUNDARIES FOR SPIKE TIME TRACKING\n")
-        f.write("=" * 70 + "\n\n")
-        f.write(f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"Number of recordings: {len(boundary_info)}\n\n")
-
-        for info in boundary_info:
-            f.write("-" * 50 + "\n")
-            f.write(f"Recording {info['index'] + 1}:\n")
-            f.write(f"  File: {info['filename']}\n")
-            f.write(f"  Full path: {info['file']}\n")
-            f.write(f"  Sampling rate: {info['sampling_rate']} Hz\n")
-            f.write(f"  Number of samples: {info['n_samples']:,}\n")
-            f.write(f"  Duration: {info['duration_sec']:.2f} sec\n")
-            f.write(f"  Start sample (inclusive): {info['start_sample']:,}\n")
-            f.write(f"  End sample (inclusive): {info['end_sample']:,}\n")
-            f.write("\n")
-
-        # Summary table for quick reference
-        f.write("=" * 70 + "\n")
-        f.write("QUICK REFERENCE TABLE\n")
-        f.write("=" * 70 + "\n")
-        f.write(f"{'Rec#':<6}{'Start Sample':<18}{'End Sample':<18}{'Filename'}\n")
-        f.write("-" * 70 + "\n")
-        for info in boundary_info:
-            f.write(f"{info['index']+1:<6}{info['start_sample']:<18,}{info['end_sample']:<18,}{info['filename']}\n")
-
-        f.write("\n" + "=" * 70 + "\n")
-        f.write("HOW TO USE:\n")
-        f.write("  To find which recording a spike belongs to:\n")
-        f.write("  - Get the spike's sample index from sorting results\n")
-        f.write("  - Find which recording's [start_sample, end_sample] range contains it\n")
-        f.write("  - Subtract start_sample to get the original sample index in that recording\n")
-        f.write("=" * 70 + "\n")
-
-    print(f"Boundary info saved to: {output_path}")
-    return output_path
+    rec_repaired = LazyArtifactRepairRecording(rec, artifact_timestamps, dither=True)
+    return rec_repaired, artifact_timestamps, current_meta
 
 
 def _process_single_recording(rec, out_folder, sorter_params, folder_name, shank,
-                               rec_folder=None, boundary_info=None):
+                               rec_folder=None, remove_artifacts=True, n_jobs=1):
     """
-    Process a single recording (or concatenated recording) through the full pipeline.
+    Process a single recording through the full pipeline.
 
     Parameters
     ----------
@@ -149,12 +89,12 @@ def _process_single_recording(rec, out_folder, sorter_params, folder_name, shank
         Sorting parameters
     folder_name : str
         Name for labeling plots
-    shank : int or str
-        Shank identifier (or "concat" for concatenated)
+    shank : int
+        Shank identifier
     rec_folder : Path, optional
         Recording folder (needed for artifact removal)
-    boundary_info : list of dict, optional
-        Boundary information for concatenated recordings
+    remove_artifacts : bool
+        Whether to run artifact detection and repair (default True)
     """
     print("Recording:", rec)
 
@@ -173,28 +113,30 @@ def _process_single_recording(rec, out_folder, sorter_params, folder_name, shank
 
     # === PREPROCESSING PIPELINE ===
     print("\n=== Preprocessing Pipeline ===")
+    _pipeline_t0 = time.time()
 
-    # 1. Detect and repair artifacts
-    print("1. Detecting and repairing artifacts (rolling_std, window=50, z=30)...")
-    rec_rm_artifacts, _artifact_cleanup, artifact_timestamps = repair_artifacts_recording(
-        rec,
-        detection_method='rolling_std',
-        rolling_window_size=50,
-        rolling_z_threshold=30,
-        n_jobs=-1,
-        time_batch_sec=sorter_params.get('artifact_time_batch_sec', None),
-    )
+    # 1. Detect and repair artifacts (cached timestamps reused on subsequent runs)
+    _t0 = time.time()
+    if remove_artifacts:
+        rec_rm_artifacts, artifact_timestamps, artifact_meta = _load_or_compute_artifacts(
+            rec, out_folder, sorter_params,
+        )
+    else:
+        print("1. Skipping artifact removal (remove_artifacts=False)...")
+        rec_rm_artifacts = rec
+        artifact_timestamps = None
+        artifact_meta = None
+    print(f"[TIMING] Step 1 artifact detection/cache: {time.time() - _t0:.2f}s")
+
+    # 2. Common median reference (CMR)
+    print("2. Applying common median reference (CMR)...")
+    rec_cmr = sp.common_reference(rec_rm_artifacts, reference='global', operator='median')
 
     # 3. Bandpass filter for spikes (300-6000 Hz)
     print("3. Applying bandpass filter (300-6000 Hz)...")
-    rec_filt = sp.bandpass_filter(rec_rm_artifacts, freq_min=300, freq_max=6000, dtype=np.float32)
+    rec_filt = sp.bandpass_filter(rec_cmr, freq_min=300, freq_max=6000, dtype=np.float32)
 
-    # Check filtered data
-    traces_filt = rec_filt.get_traces(start_frame=0, end_frame=int(rec_filt.get_sampling_frequency() * 1))
-    print(f"Filtered data range: {traces_filt.min():.2f} to {traces_filt.max():.2f}")
-    print(f"Filtered data std: {np.std(traces_filt):.2f}")
-
-    # 4. Whitening (optional but recommended)
+    # 4. Whitening
     print("4. Applying whitening...")
     recording_preprocessed: si.BaseRecording = sp.whiten(rec_filt)
 
@@ -230,15 +172,12 @@ def _process_single_recording(rec, out_folder, sorter_params, folder_name, shank
     sort_out_folder.mkdir(parents=True, exist_ok=True)
 
     # Save artifact timestamps
-    ts_save = {f'ch_{i:03d}': ts for i, ts in enumerate(artifact_timestamps)}
-    ts_save['channel_ids'] = np.array(rec.get_channel_ids())
-    np.savez(str(sort_out_folder / 'artifact_timestamps.npz'), **ts_save)
-    n_flagged = sum(len(ts) for ts in artifact_timestamps)
-    print(f"Artifact timestamps saved: {n_flagged} flagged samples across {len(artifact_timestamps)} channels")
-
-    # Save boundary info if this is a concatenated recording
-    if boundary_info is not None:
-        save_boundary_info(boundary_info, sort_out_folder)
+    if artifact_timestamps is not None:
+        ts_save = {f'ch_{i:03d}': ts for i, ts in enumerate(artifact_timestamps)}
+        ts_save['channel_ids'] = np.array(rec.get_channel_ids())
+        np.savez(str(sort_out_folder / 'artifact_timestamps.npz'), **ts_save)
+        n_flagged = sum(len(ts) for ts in artifact_timestamps)
+        print(f"Artifact timestamps saved: {n_flagged} flagged samples across {len(artifact_timestamps)} channels")
 
     # === VISUALIZATION ===
     n_snippets = 5
@@ -291,6 +230,7 @@ def _process_single_recording(rec, out_folder, sorter_params, folder_name, shank
 
     # === SPIKE SORTING ===
     timer = Timer("ms5")
+    print(f"[TIMING] Total preprocessing wall time: {time.time() - _pipeline_t0:.2f}s")
     print("\n=== Starting MountainSort5 ===")
 
     if scheme == '1':
@@ -336,23 +276,20 @@ def _process_single_recording(rec, out_folder, sorter_params, folder_name, shank
     else:
         raise ValueError(f"Invalid scheme: {scheme}. Must be '1' or '2'")
 
+    if remove_artifacts and hasattr(rec_rm_artifacts, 'print_timing_report'):
+        rec_rm_artifacts.print_timing_report()
+
     # Save parameters
     params_to_save = {
         'scheme': scheme,
         'sorter_params': sorter_params,
         'sorting_params': sorting_params.__dict__,
         'preprocessing': {
-            'car': False,
-            'artifact_removal': {
-                'method': 'rolling_std',
-                'rolling_window_size': 50,
-                'rolling_z_threshold': 30,
-            },
+            'cmr': {'reference': 'global', 'operator': 'median'},
+            'artifact_removal': artifact_meta,
             'bandpass': {'freq_min': 300, 'freq_max': 6000},
             'whitening': True,
         },
-        'concatenated': boundary_info is not None,
-        'source_files': [info['file'] for info in boundary_info] if boundary_info else None
     }
     with open(sort_out_folder / "sorting_params.json", "w") as f:
         json.dump(params_to_save, f, indent=2)
@@ -382,12 +319,12 @@ def _process_single_recording(rec, out_folder, sorter_params, folder_name, shank
     # Compute metrics
     try:
         print("\n=== Computing Waveforms and Metrics ===")
-        si.set_global_job_kwargs(n_jobs=-1, chunk_duration="1s", progress_bar=True)
-        sorting_analyzer.compute(['random_spikes', 'waveforms', 'noise_levels'])
+        si.set_global_job_kwargs(n_jobs=n_jobs, progress_bar=True)
+        sorting_analyzer.compute(['random_spikes', 'waveforms', 'noise_levels'], n_jobs=n_jobs)
         sorting_analyzer.compute('templates')
         _ = sorting_analyzer.compute('template_similarity')
-        _ = sorting_analyzer.compute('spike_amplitudes')
-        _ = sorting_analyzer.compute('correlograms')
+        _ = sorting_analyzer.compute('spike_amplitudes', n_jobs=n_jobs)
+        _ = sorting_analyzer.compute('correlograms', n_jobs=n_jobs)
         _ = sorting_analyzer.compute('unit_locations')
 
         out_fig_folder = sort_out_folder / 'raw_units'
@@ -404,43 +341,37 @@ def _process_single_recording(rec, out_folder, sorter_params, folder_name, shank
 
     except Exception as e:
         print(f"Error during metrics computation: {e}")
-        import traceback
         traceback.print_exc()
 
     print(f"\n=== Shank {shank} Complete ===")
     print(f"Results saved to: {sort_out_folder}")
 
-    # Release all objects that hold the artifact memmap open before deleting it.
-    # Chain: sorting_analyzer → sorting → recording_preprocessed → rec_filt → rec_rm_artifacts → memmap
-    import gc
-    del sorting_analyzer, sorting, recording_preprocessed, rec_filt, rec_rm_artifacts
-    gc.collect()
-    _artifact_cleanup()
 
 
-def main(rec_folder=None, nwb_files=None, sorter_params=None, shanks=[0], animal_id="", shank_id=None, sortout=None):
+def main(rec_folder=None, sorter_params=None, shanks=None, animal_id="", sortout=None,
+         remove_artifacts=True, n_jobs=1):
     """
     Main spike sorting function.
 
     Parameters
     ----------
-    rec_folder : str or Path, optional
-        Path to recording folder (for single recording mode)
-    nwb_files : list, optional
-        List of NWB file paths to concatenate and sort together
-        If provided, rec_folder and shanks are ignored
+    rec_folder : str or Path
+        Path to recording folder
     sorter_params : dict
         Dictionary containing sorting parameters
     shanks : list
-        List of shank indices to process (only used with rec_folder)
+        List of shank indices to process
     animal_id : str
         Animal identifier
-    shank_id : int, optional
-        Shank identifier for concatenated mode folder naming
-    sortout : str or Path, optional
-        Output folder for sorting results. If None, user is prompted once per main() call.
+    sortout : str or Path
+        Output folder for sorting results.
+    remove_artifacts : bool
+        Whether to run artifact detection and repair (default True)
     """
     # Default parameters if none provided
+    if shanks is None:
+        shanks = [0]
+
     if sorter_params is None:
         sorter_params = {
             "scheme": "1",
@@ -450,49 +381,13 @@ def main(rec_folder=None, nwb_files=None, sorter_params=None, shanks=[0], animal
             "npca_per_channel": 3,
             "npca_per_subdivision": 10
         }
-    
+
     if sortout is None:
         raise ValueError("sortout must be provided (set 'sortout' in the JSON config)")
     sortout = Path(sortout)
 
-    # Mode 1: Concatenate multiple NWB files
-    if nwb_files is not None and len(nwb_files) > 0:
-        print("\n" + "=" * 60)
-        print("CONCATENATED RECORDING MODE")
-        print("=" * 60)
-
-        # Load and concatenate recordings
-        rec, boundary_info = load_and_concatenate_recordings(nwb_files)
-
-        # Create output folder for concatenated sorting
-        # Structure: sortout/animal_id/rec1_rec2_concat_sh{N}/shank{N}/
-        # Extract folder names from nwb file paths (parent.parent is the .rec folder)
-        rec_folder_names = []
-        for nwb_file in nwb_files:
-            nwb_path = Path(nwb_file)
-            # Parent is the .rec folder, get its name without .rec extension
-            rec_folder_name = nwb_path.parent.stem  # .stem removes .rec extension
-            rec_folder_names.append(rec_folder_name)
-
-        concat_name = "_".join(rec_folder_names) + "_concat"
-        shank_folder = f"shank{shank_id}" if shank_id is not None else "shank_concat"
-        out_folder = Path(sortout) / animal_id / concat_name / shank_folder
-        out_folder.mkdir(parents=True, exist_ok=True)
-
-        # Process this single concatenated recording
-        _process_single_recording(
-            rec=rec,
-            out_folder=out_folder,
-            sorter_params=sorter_params,
-            boundary_info=boundary_info,
-            folder_name=f"{animal_id}_concatenated",
-            shank=shank_id if shank_id is not None else "concat"
-        )
-        return
-
-    # Mode 2: Original single folder mode
     if rec_folder is None:
-        raise ValueError("Either rec_folder or nwb_files must be provided")
+        raise ValueError("rec_folder must be provided")
 
     rec_folder = Path(rec_folder)
     _, session_id, folder_name = parse_session_info(str(rec_folder))
@@ -519,36 +414,22 @@ def main(rec_folder=None, nwb_files=None, sorter_params=None, shanks=[0], animal
             folder_name=folder_name,
             shank=shank,
             rec_folder=rec_folder,
-            boundary_info=None
+            remove_artifacts=remove_artifacts,
+            n_jobs=n_jobs,
         )
 
 
 def process_from_json(json_file="sorting_files.json"):
     """Read JSON configuration and process recordings.
 
-    JSON format supports three modes:
-
-    1. Single folder mode (original):
+    JSON format:
     {
         "recordings": [
             {"path": "/path/to/folder", "shanks": [0, 1], "animal_id": "M001"}
-        ]
+        ],
+        "sortout": "/path/to/output",
+        "sorter_params": {...}
     }
-
-    2. Multiple paths with concatenation option:
-    {
-        "recordings": [
-            {
-                "paths": ["/path/to/folder1", "/path/to/folder2"],
-                "shanks": [0, 1, 2, 3],
-                "animal_id": "M001",
-                "concatenate": true  // or false
-            }
-        ]
-    }
-
-    When concatenate=true: for each shank, concatenate NWB files from all paths
-    When concatenate=false: process each path separately (same as calling with single path multiple times)
     """
 
     # Get the directory where this script is located
@@ -567,6 +448,8 @@ def process_from_json(json_file="sorting_files.json"):
     if sortout is None:
         raise ValueError("'sortout' key is required in the JSON config")
 
+    global_n_jobs = config.get('n_jobs', 1)
+
     # Process each recording
     for i, rec in enumerate(config['recordings'], 1):
         animal_id = rec.get('animal_id', '')
@@ -574,106 +457,33 @@ def process_from_json(json_file="sorting_files.json"):
         # Use recording-specific params if available, otherwise use global
         sorter_params = rec.get('sorter_params', global_sorter_params)
 
-        # Check for multiple paths mode
-        paths = rec.get('paths', None)
+        rec_folder = Path(rec['path'])
+        shanks = rec['shanks']
+        remove_artifacts = rec.get('remove_artifacts', True)
+        n_jobs = rec.get('n_jobs', global_n_jobs)
 
-        if paths is not None:
-            # Multiple paths mode
-            shanks = rec['shanks']
-            concatenate = rec.get('concatenate', False)
+        print(f"\n{'='*60}")
+        print(f"[{i}/{len(config['recordings'])}] Processing: {rec_folder.name}")
+        print(f"  Animal ID: {animal_id}")
+        print(f"  Shanks: {shanks}")
+        print(f"  Scheme: {sorter_params.get('scheme', '1')}")
+        print(f"  Threshold: {sorter_params.get('detect_threshold', 5.5)}")
+        print(f"  Remove artifacts: {remove_artifacts}")
+        print(f"  n_jobs: {n_jobs}")
+        print(f"{'='*60}")
 
-            if concatenate:
-                # Concatenate mode: for each shank, concatenate NWB files from all paths
-                print(f"\n{'='*60}")
-                print(f"[{i}/{len(config['recordings'])}] Processing CONCATENATED (multiple paths):")
-                print(f"  Animal ID: {animal_id}")
-                print(f"  Paths: {len(paths)}")
-                for p in paths:
-                    print(f"    - {Path(p).name}")
-                print(f"  Shanks: {shanks}")
-                print(f"  Scheme: {sorter_params.get('scheme', '1')}")
-                print(f"  Threshold: {sorter_params.get('detect_threshold', 5.5)}")
-                print(f"{'='*60}")
-
-                # Process each shank with concatenated recordings
-                for shank in shanks:
-                    print(f"\n--- Processing Shank {shank} (concatenated) ---")
-
-                    # Build list of NWB files for this shank from all paths
-                    nwb_files = []
-                    for p in paths:
-                        rec_folder = Path(p)
-                        _, _, folder_name = parse_session_info(str(rec_folder))
-                        nwb_file = rec_folder / f"{folder_name}sh{shank}.nwb"
-
-                        if not nwb_file.exists():
-                            print(f"WARNING: NWB file not found: {nwb_file}")
-                            continue
-                        nwb_files.append(str(nwb_file))
-
-                    if len(nwb_files) < 2:
-                        print(f"ERROR: Need at least 2 NWB files to concatenate, found {len(nwb_files)}")
-                        continue
-
-                    try:
-                        main(nwb_files=nwb_files,
-                             sorter_params=sorter_params,
-                             animal_id=animal_id,
-                             shank_id=shank,
-                             sortout=sortout)
-                    except Exception as e:
-                        print(f"ERROR processing shank {shank}: {e}")
-                        import traceback
-                        traceback.print_exc()
-                        continue
-            else:
-                # Non-concatenate mode: process each path separately
-                for p in paths:
-                    rec_folder = Path(p)
-
-                    print(f"\n{'='*60}")
-                    print(f"[{i}/{len(config['recordings'])}] Processing: {rec_folder.name}")
-                    print(f"  Animal ID: {animal_id}")
-                    print(f"  Shanks: {shanks}")
-                    print(f"  Scheme: {sorter_params.get('scheme', '1')}")
-                    print(f"  Threshold: {sorter_params.get('detect_threshold', 5.5)}")
-                    print(f"{'='*60}")
-
-                    try:
-                        main(rec_folder=rec_folder,
-                             sorter_params=sorter_params,
-                             shanks=shanks,
-                             animal_id=animal_id,
-                             sortout=sortout)
-                    except Exception as e:
-                        print(f"ERROR processing {rec_folder.name}: {e}")
-                        import traceback
-                        traceback.print_exc()
-                        continue
-        else:
-            # Single folder mode (original) - "path" instead of "paths"
-            rec_folder = Path(rec['path'])
-            shanks = rec['shanks']
-
-            print(f"\n{'='*60}")
-            print(f"[{i}/{len(config['recordings'])}] Processing: {rec_folder.name}")
-            print(f"  Animal ID: {animal_id}")
-            print(f"  Shanks: {shanks}")
-            print(f"  Scheme: {sorter_params.get('scheme', '1')}")
-            print(f"  Threshold: {sorter_params.get('detect_threshold', 5.5)}")
-            print(f"{'='*60}")
-
-            try:
-                main(rec_folder=rec_folder,
-                     sorter_params=sorter_params,
-                     shanks=shanks,
-                     animal_id=animal_id,
-                     sortout=sortout)
-            except Exception as e:
-                print(f"ERROR processing {rec_folder.name}: {e}")
-                import traceback
-                traceback.print_exc()
-                continue
+        try:
+            main(rec_folder=rec_folder,
+                 sorter_params=sorter_params,
+                 shanks=shanks,
+                 animal_id=animal_id,
+                 sortout=sortout,
+                 remove_artifacts=remove_artifacts,
+                 n_jobs=n_jobs)
+        except Exception as e:
+            print(f"ERROR processing {rec_folder.name}: {e}")
+            traceback.print_exc()
+            continue
 
 
 if __name__ == "__main__":

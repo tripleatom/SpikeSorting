@@ -568,34 +568,34 @@ class SpikeGadgetsRecToNWB:
 
 
 # ---------------------------------------------------------------------------
-# CLI entry point
+# Programmatic entry point (used by batch_rec2nwb.py)
 # ---------------------------------------------------------------------------
 
-def main():
-    chunk_input = input("Chunk duration in seconds (Enter for auto based on available RAM): ").strip()
-    chunk_duration = float(chunk_input) if chunk_input else None
+def process_folder(config: dict) -> None:
+    """Run the full conversion pipeline for one folder from a config dict.
 
-    parallel_shank = input("Process all shanks in parallel per chunk? [y/N]: ").strip().lower() == 'y'
+    Config keys:
+        chunk_duration         : float | None  (None = auto RAM-based)
+        parallel_shank         : bool
+        data_folder            : str or Path
+        impedance_path         : str | None
+        electrode_location     : str
+        experiment_description : str
+        animal_id              : str
+        device_type            : str
+        shanks                 : list[int]
+    """
+    chunk_duration = config.get('chunk_duration')
+    parallel_shank = config.get('parallel_shank', False)
+    data_folder = Path(config['data_folder'])
+    impedance_file = Path(config['impedance_path']) if config.get('impedance_path') else None
+    electrode_location = config['electrode_location']
+    exp_desc = config.get('experiment_description', 'None')
+    device_type = config['device_type']
+    shanks = config['shanks']
 
     converter = SpikeGadgetsRecToNWB(chunk_duration=chunk_duration,
                                      parallelShank=parallel_shank)
-
-    data_folder = Path(input("Path to the folder containing .rec files: ").strip().strip("'\""))
-    if not data_folder.exists():
-        print(f"Folder {data_folder} does not exist, exiting.")
-        sys.exit(1)
-
-    impedance_input = input("Path to impedance file (optional, Enter to skip): ").strip().strip("'\"")
-    impedance_file = Path(impedance_input) if impedance_input else None
-    electrode_location = input("Electrode location: ").strip()
-    exp_desc = input("Experiment description: ").strip() or "None"
-
-    animal_id = get_animal_id(data_folder)
-    device_type = get_or_set_device_type(animal_id)
-
-    raw = input("Shank numbers (e.g. 0,1,2,3 or [0,1,2,3]): ")
-    shanks = [int(x) for x in re.findall(r'\d+', raw)]
-    print(f"Processing shanks: {shanks}")
 
     # Discover and log data files
     data_files = converter.get_data_files(data_folder)
@@ -710,6 +710,48 @@ def main():
     print("\n" + "="*60)
     print("Conversion completed successfully!")
     print("="*60)
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    chunk_input = input("Chunk duration in seconds (Enter for auto based on available RAM): ").strip()
+    chunk_duration = float(chunk_input) if chunk_input else None
+
+    parallel_shank = input("Process all shanks in parallel per chunk? [y/N]: ").strip().lower() == 'y'
+
+    data_folder = Path(input("Path to the folder containing .rec files: ").strip().strip("'\""))
+    if not data_folder.exists():
+        print(f"Folder {data_folder} does not exist, exiting.")
+        sys.exit(1)
+
+    impedance_input = input("Path to impedance file (optional, Enter to skip): ").strip().strip("'\"")
+    impedance_path = impedance_input if impedance_input else None
+    electrode_location = input("Electrode location: ").strip()
+    exp_desc = input("Experiment description: ").strip() or "None"
+
+    animal_id = get_animal_id(data_folder)
+    device_type = get_or_set_device_type(animal_id)
+
+    raw = input("Shank numbers (e.g. 0,1,2,3 or [0,1,2,3]): ")
+    shanks = [int(x) for x in re.findall(r'\d+', raw)]
+    print(f"Processing shanks: {shanks}")
+
+    config = {
+        'chunk_duration': chunk_duration,
+        'parallel_shank': parallel_shank,
+        'data_folder': str(data_folder),
+        'impedance_path': impedance_path,
+        'electrode_location': electrode_location,
+        'experiment_description': exp_desc,
+        'animal_id': animal_id,
+        'device_type': device_type,
+        'shanks': shanks,
+    }
+
+    process_folder(config)
 
 
 if __name__ == "__main__":
