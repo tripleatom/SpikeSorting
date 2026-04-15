@@ -432,7 +432,7 @@ def main(rec_folder=None, sorter_params=None, shanks=None, animal_id="", sortout
     print("\nAll shanks complete.")
 
 
-def process_from_json(json_file="sorting_files.json"):
+def process_from_json(json_file="MSSortingFiles.json"):
     """Read JSON configuration and process recordings.
 
     JSON format:
