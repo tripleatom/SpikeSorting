@@ -742,6 +742,8 @@ class LazyArtifactRepairRecording(BaseRecording):
 
     def __init__(self, recording, artifact_timestamps, window=50,
                  gap_pad_samples=2, correct_dc_offset=True, dither=True, rng=None):
+        # Normalise to numpy arrays (input may be lists when reconstructed from _kwargs)
+        artifact_timestamps = [np.asarray(ts) for ts in artifact_timestamps]
         channel_ids = recording.get_channel_ids()
         super().__init__(
             sampling_frequency=recording.get_sampling_frequency(),
@@ -786,7 +788,7 @@ class LazyArtifactRepairRecording(BaseRecording):
 
         self._kwargs = dict(
             recording=recording,
-            artifact_timestamps=artifact_timestamps,
+            artifact_timestamps=[ts.tolist() for ts in artifact_timestamps],
             window=window,
             gap_pad_samples=gap_pad_samples,
             correct_dc_offset=correct_dc_offset,

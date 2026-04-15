@@ -3,6 +3,8 @@ import time
 import json
 import traceback
 from pathlib import Path
+import matplotlib
+matplotlib.use('Agg')  # non-interactive backend — avoids Tkinter errors in worker processes
 import matplotlib.pyplot as plt
 import numpy as np
 import spikeinterface as si
@@ -74,27 +76,14 @@ def _load_or_compute_artifacts(rec, out_folder, sorter_params):
     return rec_repaired, artifact_timestamps, current_meta
 
 
-def _process_single_recording(rec, out_folder, sorter_params, folder_name, shank,
-                               rec_folder=None, remove_artifacts=True, n_jobs=1):
+def _sort_shank(rec, out_folder, sorter_params, folder_name, shank,
+                remove_artifacts=True):
     """
-    Process a single recording through the full pipeline.
+    Preprocessing + MountainSort5 for a single shank.
 
-    Parameters
-    ----------
-    rec : BaseRecording
-        The recording to process
-    out_folder : Path
-        Output folder for results
-    sorter_params : dict
-        Sorting parameters
-    folder_name : str
-        Name for labeling plots
-    shank : int
-        Shank identifier
-    rec_folder : Path, optional
-        Recording folder (needed for artifact removal)
-    remove_artifacts : bool
-        Whether to run artifact detection and repair (default True)
+    Returns (sorting_analyzer, sort_out_folder).
+    Metrics are intentionally excluded so they can run in a background thread
+    while the next shank sorts.
     """
     print("Recording:", rec)
 
@@ -305,47 +294,65 @@ def _process_single_recording(rec, out_folder, sorter_params, folder_name, shank
         print(f"  Unit {unit_id}: {count} spikes ({rate:.2f} Hz)")
 
     # Register recording and create a sorting analyzer
-    sorting.register_recording(recording_preprocessed)
+    # Use rec_filt (bandpass-filtered, in µV) so spike amplitudes are in physical units,
+    # not whitened units.
+    sorting.register_recording(rec_filt)
 
     analyzer_folder = sort_out_folder / "sorting_analyzer"
     sorting_analyzer = si.create_sorting_analyzer(
         sorting=sorting,
-        recording=recording_preprocessed,
+        recording=rec_filt,
         format="binary_folder",
         folder=str(analyzer_folder)
     )
     print("Sorting analyzer:", sorting_analyzer)
+    print(f"\n=== Shank {shank} sorting complete — submitting metrics to background ===")
 
-    # Compute metrics
+    return sorting_analyzer, sort_out_folder
+
+
+def _compute_metrics(sorting_analyzer, sort_out_folder, n_jobs=1):
+    """
+    Compute waveforms, metrics, and unit summary plots.
+    """
+    def _compute_if_missing(name, **kwargs):
+        if sorting_analyzer.get_extension(name) is not None:
+            print(f"  Skipping '{name}' (already computed).")
+            return
+        sorting_analyzer.compute(name, **kwargs)
+
     try:
-        print("\n=== Computing Waveforms and Metrics ===")
+        print(f"\n=== Computing Waveforms and Metrics: {sort_out_folder.name} ===")
         si.set_global_job_kwargs(n_jobs=n_jobs, progress_bar=True)
-        sorting_analyzer.compute(['random_spikes', 'waveforms', 'noise_levels'], n_jobs=n_jobs)
-        sorting_analyzer.compute('templates')
-        _ = sorting_analyzer.compute('template_similarity')
-        _ = sorting_analyzer.compute('spike_amplitudes', n_jobs=n_jobs)
-        _ = sorting_analyzer.compute('correlograms', n_jobs=n_jobs)
-        _ = sorting_analyzer.compute('unit_locations')
+        # random_spikes and waveforms must be computed together if either is missing
+        if (sorting_analyzer.get_extension('random_spikes') is None or
+                sorting_analyzer.get_extension('waveforms') is None):
+            sorting_analyzer.compute(['random_spikes', 'waveforms', 'noise_levels'], n_jobs=n_jobs)
+        else:
+            print("  Skipping 'random_spikes', 'waveforms', 'noise_levels' (already computed).")
+        _compute_if_missing('templates')
+        _compute_if_missing('template_similarity')
+        _compute_if_missing('spike_amplitudes', n_jobs=n_jobs)
+        # _compute_if_missing('principal_components', n_components=5, mode='concatenated', n_jobs=n_jobs)
+        _compute_if_missing('correlograms', n_jobs=n_jobs)
+        _compute_if_missing('unit_locations')
 
         out_fig_folder = sort_out_folder / 'raw_units'
         out_fig_folder.mkdir(parents=True, exist_ok=True)
 
-        print(f"\n=== Generating Unit Summary Plots ===")
-        for unit_id in sorting.get_unit_ids():
+        print(f"\n=== Generating Unit Summary Plots: {sort_out_folder.name} ===")
+        for unit_id in sorting_analyzer.sorting.get_unit_ids():
             print(f"  Plotting unit {unit_id}...")
             sw.plot_unit_summary(sorting_analyzer, unit_id=unit_id)
             plt.savefig(out_fig_folder / f'unit_summary_{unit_id}.png', dpi=150)
             plt.close()
 
         print(f"Summary plots saved to: {out_fig_folder}")
+        print(f"\n=== Metrics complete: {sort_out_folder} ===")
 
     except Exception as e:
-        print(f"Error during metrics computation: {e}")
+        print(f"Error during metrics computation ({sort_out_folder}): {e}")
         traceback.print_exc()
-
-    print(f"\n=== Shank {shank} Complete ===")
-    print(f"Results saved to: {sort_out_folder}")
-
 
 
 def main(rec_folder=None, sorter_params=None, shanks=None, animal_id="", sortout=None,
@@ -367,6 +374,8 @@ def main(rec_folder=None, sorter_params=None, shanks=None, animal_id="", sortout
         Output folder for sorting results.
     remove_artifacts : bool
         Whether to run artifact detection and repair (default True)
+    n_jobs : int
+        Number of parallel workers for metrics computation
     """
     # Default parameters if none provided
     if shanks is None:
@@ -393,7 +402,6 @@ def main(rec_folder=None, sorter_params=None, shanks=None, animal_id="", sortout
     _, session_id, folder_name = parse_session_info(str(rec_folder))
 
     for shank in shanks:
-        # Construct paths for NWB file and output folder
         nwb_folder = rec_folder / f"{folder_name}sh{shank}.nwb"
         if not nwb_folder.exists():
             print(f"NWB file not found: {nwb_folder}")
@@ -403,20 +411,25 @@ def main(rec_folder=None, sorter_params=None, shanks=None, animal_id="", sortout
             f"{animal_id}_{session_id}" / f"shank{shank}"
         out_folder.mkdir(parents=True, exist_ok=True)
 
-        # Load recording from NWB file
         rec = se.NwbRecordingExtractor(str(nwb_folder))
 
-        # Process this single recording
-        _process_single_recording(
-            rec=rec,
-            out_folder=out_folder,
-            sorter_params=sorter_params,
-            folder_name=folder_name,
-            shank=shank,
-            rec_folder=rec_folder,
-            remove_artifacts=remove_artifacts,
-            n_jobs=n_jobs,
-        )
+        try:
+            sorting_analyzer, sort_out_folder = _sort_shank(
+                rec=rec,
+                out_folder=out_folder,
+                sorter_params=sorter_params,
+                folder_name=folder_name,
+                shank=shank,
+                remove_artifacts=remove_artifacts,
+            )
+        except Exception as e:
+            print(f"Sorting failed for shank {shank}: {e}")
+            traceback.print_exc()
+            continue
+
+        _compute_metrics(sorting_analyzer, sort_out_folder, n_jobs)
+
+    print("\nAll shanks complete.")
 
 
 def process_from_json(json_file="sorting_files.json"):
