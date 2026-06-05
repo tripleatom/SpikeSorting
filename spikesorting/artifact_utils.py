@@ -431,6 +431,8 @@ def detect_artifacts_recording(
     rolling_z_threshold=5,
     batch_size=None,
     time_batch_sec=None,
+    use_global_stats=True,
+    global_stats_sample_batches=None,
 ):
     """
     Detect artifact timestamps without repairing or writing to disk.
@@ -451,6 +453,14 @@ def detect_artifacts_recording(
         Channels per get_traces call. None = all channels at once.
     time_batch_sec : float, optional
         Process in time chunks of this many seconds. None = all at once.
+    use_global_stats : bool, default True
+        For rolling_std detection, make a first pass over the whole recording to
+        estimate per-channel median/IQR baselines. If False, normalize each time
+        batch independently for a faster one-pass detector.
+    global_stats_sample_batches : int, optional
+        If using global rolling_std stats, estimate the global baseline from this
+        many evenly spaced time batches instead of every batch. None or values
+        greater than the number of batches keep the original full stats pass.
 
     Returns
     -------
@@ -486,10 +496,30 @@ def detect_artifacts_recording(
     # pass so the Z-score threshold is anchored to the full-recording baseline rather
     # than fluctuating with each 600 s batch.
     global_median = global_scale = None
-    if detection_method == 'rolling_std':
-        print("Pass 1/2: computing global normalization statistics...", flush=True)
+    if detection_method not in ('slope', 'rolling_std'):
+        raise ValueError("detection_method must be 'slope' or 'rolling_std'")
+
+    if detection_method == 'rolling_std' and use_global_stats:
+        stats_batches = time_batches
+        if global_stats_sample_batches is not None:
+            n_stats = int(global_stats_sample_batches)
+            if n_stats <= 0:
+                raise ValueError("global_stats_sample_batches must be positive or None")
+            if n_stats < len(time_batches):
+                stats_idx = np.linspace(0, len(time_batches) - 1, n_stats, dtype=int)
+                stats_batches = [time_batches[i] for i in np.unique(stats_idx)]
+
+        if len(stats_batches) == len(time_batches):
+            print("Pass 1/2: computing global normalization statistics...", flush=True)
+        else:
+            print(
+                "Pass 1/2: estimating global normalization statistics from "
+                f"{len(stats_batches)}/{len(time_batches)} evenly spaced batches...",
+                flush=True,
+            )
+
         batch_medians, batch_q25s, batch_q75s = [], [], []
-        for t_start in tqdm(time_batches, desc="Stats pass", unit="batch"):
+        for t_start in tqdm(stats_batches, desc="Stats pass", unit="batch"):
             t_end      = min(t_start + time_batch_samples, n_samples)
             load_start = max(0, t_start - overlap_samples)
             load_end   = min(n_samples, t_end + overlap_samples)
@@ -508,6 +538,8 @@ def detect_artifacts_recording(
         global_iqr    = np.median(np.stack(batch_q75s), axis=0) - np.median(np.stack(batch_q25s), axis=0)
         global_scale  = np.where(global_iqr > 0, global_iqr / 1.35, 1.0)
         print("Pass 2/2: detecting artifacts with global thresholds...", flush=True)
+    elif detection_method == 'rolling_std':
+        print("Using one-pass per-batch normalization (global stats disabled).", flush=True)
 
     artifact_timestamps = [[] for _ in range(n_channels)]
 

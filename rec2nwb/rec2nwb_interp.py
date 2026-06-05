@@ -34,6 +34,7 @@ from contextlib import ExitStack
 from datetime import datetime
 from pathlib import Path
 from queue import Queue
+from zoneinfo import ZoneInfo
 import sys
 import numpy as np
 import pandas as pd
@@ -61,6 +62,8 @@ from rec2nwb.utils.nwb_helpers import (
     make_nwbfile, add_electrodes_to_nwb, make_electrical_series,
     append_chunk_to_nwb, nwb_direct_writer,
 )
+
+HOUSTON_TZ = ZoneInfo("America/Chicago")
 
 
 def _prefetch_chunks(gen, prefetch: int = 1):
@@ -112,10 +115,11 @@ class SpikeGadgetsRecToNWB:
         return data_folder.name
 
     def get_timestamp(self, file_path: Path) -> datetime:
-        """Parse the recording start datetime from the filename."""
-        m = re.search(r"_(\d{8})_(\d{6})", file_path.name)
+        """Parse recording start datetime from the filename as Houston local time."""
+        m = re.search(r"(20\d{6})_(\d{6})", file_path.name)
         if m:
-            return datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
+            dt = datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
+            return dt.replace(tzinfo=HOUSTON_TZ)
         raise ValueError(f"Cannot parse timestamp from filename: {file_path.name}")
 
     # ------------------------------------------------------------------

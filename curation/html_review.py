@@ -564,6 +564,36 @@ def _fmt(val, decimals=3, suffix="") -> str:
         return str(val)
 
 
+def _get_primary_channel(rec_name: str, uid: str) -> "int | None":
+    """Primary channel index (highest peak-to-peak amplitude) for one unit."""
+    sa = _get_analyzer(rec_name)
+    if sa is None:
+        return None
+    templates = _get_templates(sa)
+    if templates is None:
+        return None
+    uid_list = list(sa.unit_ids)
+    uid_cast = _cast_uid(uid, uid_list)
+    if uid_cast is None:
+        return None
+    idx = uid_list.index(uid_cast)
+    p2p = templates[idx].max(axis=0) - templates[idx].min(axis=0)
+    return int(p2p.argmax())
+
+
+def _get_unit_depth(rec_name: str, ch: "int | None") -> float:
+    """Y-coordinate (µm) of the primary channel — used for depth ordering."""
+    if ch is None:
+        return 0.0
+    sa = _get_analyzer(rec_name)
+    if sa is None:
+        return 0.0
+    try:
+        return float(sa.get_probe().contact_positions[ch, 1])
+    except Exception:
+        return 0.0
+
+
 def build_unit_records(units: list, labels: dict) -> list:
     records = []
     for rec_name, uid, img_path in units:
@@ -572,6 +602,7 @@ def build_unit_records(units: list, labels: dict) -> list:
         existing_label = labels.get(rec_name, {}).get(uid, "")
         reasons = _get_reject_reasons(m) if auto == "Noise" else (
                   _get_sua_failures(m)   if auto == "MUA"   else [])
+        ch = _get_primary_channel(rec_name, uid)
         records.append({
             "rec":     rec_name,
             "uid":     uid,
@@ -579,6 +610,8 @@ def build_unit_records(units: list, labels: dict) -> list:
             "auto":    auto,
             "label":   existing_label,
             "reasons": reasons,
+            "contact": ch,
+            "depth":   _get_unit_depth(rec_name, ch),
             "m": {
                 "snr":      _fmt(m.get("snr"),                  2),
                 "fr":       _fmt(m.get("firing_rate"),          3, " Hz"),
@@ -1192,7 +1225,15 @@ function renderGrid() {
   visibleCards    = [];
   focusIdx        = -1;
 
-  UNITS.forEach((u, i) => {
+  const sorted = [...UNITS].sort((a, b) => {
+    if (a.rec < b.rec) return -1;
+    if (a.rec > b.rec) return 1;
+    const ca = (a.contact != null) ? a.contact : Infinity;
+    const cb = (b.contact != null) ? b.contact : Infinity;
+    if (ca !== cb) return ca - cb;
+    return parseInt(a.uid) - parseInt(b.uid);
+  });
+  sorted.forEach((u, i) => {
     if (!autoShow.has(u.auto))  return;
     if (!recShow.has(u.rec))    return;
     const card = buildCard(u, i);
@@ -2488,6 +2529,7 @@ def _build_html_content(labels: dict, auto_merge_groups: dict, user_merge_groups
     print("Encoding images and loading metrics (first run may take a moment) ...")
 
     records = build_unit_records(units, labels)
+    records.sort(key=lambda r: (r["rec"], r.get("depth", 0.0)))
     thresholds = {
         "noise_snr":     NOISE_SNR_THRESHOLD,
         "noise_presence":NOISE_PRESENCE_THRESHOLD,

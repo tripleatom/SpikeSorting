@@ -12,6 +12,13 @@ from rec2nwb.preproc_func import get_or_set_device_type, get_animal_id
 from spikesorting.ss_proc_func import get_sortout_folder
 
 
+def get_n_shank(device_type: str) -> int:
+    script_dir = Path(__file__).resolve().parent
+    mapping_file = script_dir / "mapping" / f"{device_type}.csv"
+    sh = pd.read_csv(mapping_file)['sh'].astype(int)
+    return int(sh.nunique())
+
+
 def get_ch_index_on_shank(ish: int, device_type: str) -> tuple:
     """
     Return the channel indices on a given shank.
@@ -133,7 +140,8 @@ class BadChannelScreener:
             def _part_num(p: Path) -> int:
                 m = re.search(r'\.part(\d+)\.rec$', p.name)
                 return int(m.group(1)) if m else 0
-            data_files = sorted(data_folder.glob('*.rec'), key=_part_num)
+            data_files = sorted(
+                (p for p in data_folder.rglob('*.rec') if p.is_file()), key=_part_num)
 
         if not data_files:
             file_types = ".rhd/.rhs" if self.recording_method == 'intan' else ".rec"
@@ -157,7 +165,7 @@ class BadChannelScreener:
 
     def manual_bad_ch_id(self, animal_id, data_folder: Path, first_file: Path, n_shank: int,
                         impedance_path: Path = None, device_type: str = "4shank16",
-                        n_segments: int = 10) -> list:
+                        n_segments: int = 10, target_shank: int = None) -> list:
         """
         Manually screen bad channels across shanks with RANDOM segment selection.
         Continues until user presses 'Finish' button.
@@ -202,7 +210,8 @@ class BadChannelScreener:
 
         all_bad_ch_ids = []
 
-        for ishank in range(n_shank):
+        shanks_to_screen = [target_shank] if target_shank is not None else list(range(n_shank))
+        for ishank in shanks_to_screen:
             print(f"Processing shank {ishank}...")
             # Make output folder for this shank
             out_folder = out_root / f"shank{ishank}"
@@ -367,7 +376,7 @@ def main():
         folder_prompt = "Enter full path to Intan data folder: "
     elif choice == '2':
         recording_method = 'spikegadget_rec'
-        folder_prompt = "Enter full path to .rec folder: "
+        folder_prompt = "Enter path to session folder (e.g. G:\\CnL42SG\\CnL42SG_20260302): "
     else:
         print("Invalid choice. Exiting.")
         return
@@ -392,12 +401,16 @@ def main():
     device_type = get_or_set_device_type(animal_id)
     print("Using device type:", device_type)
     
-    # Get number of shanks
-    n_shank = int(input("Enter the number of shanks: ").strip())
-    
+    n_shank = get_n_shank(device_type)
+    print(f"Detected {n_shank} shanks from mapping.")
+
     # Get number of random segments to generate
     n_segments_input = input("Enter number of random segments to generate (default: 10): ").strip()
     n_segments = int(n_segments_input) if n_segments_input else 10
+
+    # Optionally target a single shank
+    shank_input = input("Enter shank number to screen (press Enter to screen all): ").strip()
+    target_shank = int(shank_input) if shank_input else None
 
     # Get data files
     try:
@@ -412,7 +425,7 @@ def main():
     try:
         bad_channels = screener.manual_bad_ch_id(
             animal_id, data_folder, first_file, n_shank, impedance_file, device_type,
-            n_segments)
+            n_segments, target_shank)
         print(f"Screening completed. Found {len(bad_channels)} bad channels total.")
     except Exception as e:
         print(f"Error during screening: {e}")

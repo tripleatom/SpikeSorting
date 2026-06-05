@@ -5,3 +5,8 @@ build
 .DS_Store
 *.json
 *.egg-info
+benchmark_results
+.claude
+.vscode
+*test*
+*record

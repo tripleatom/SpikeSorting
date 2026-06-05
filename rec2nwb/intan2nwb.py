@@ -2,6 +2,7 @@ import re
 import time
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 import sys
 import numpy as np
 import pandas as pd
@@ -18,6 +19,8 @@ from rec2nwb.utils.nwb_helpers import (
     make_nwbfile, add_electrodes_to_nwb, make_electrical_series,
     append_nwb_dset, append_chunk_to_nwb,
 )
+
+HOUSTON_TZ = ZoneInfo("America/Chicago")
 
 
 class EphysToNWBConverter:
@@ -56,10 +59,11 @@ class EphysToNWBConverter:
         return reader.header['signal_streams']['id']
 
     def get_timestamp(self, file_path: Path) -> datetime:
-        """Parse the recording start datetime from the filename."""
+        """Parse recording start datetime from the filename as Houston local time."""
         m = re.match(r"[a-zA-Z0-9_]+_([0-9]+_[0-9]+)\.rh(?:s|d)", file_path.name)
         if m:
-            return datetime.strptime(m.group(1), "%y%m%d_%H%M%S")
+            dt = datetime.strptime(m.group(1), "%y%m%d_%H%M%S")
+            return dt.replace(tzinfo=HOUSTON_TZ)
         raise ValueError(f"Cannot parse timestamp from filename: {file_path.name}")
 
     # ------------------------------------------------------------------

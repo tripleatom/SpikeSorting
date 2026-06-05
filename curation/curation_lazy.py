@@ -26,18 +26,14 @@ from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import matplotlib.image as mpimg
-from matplotlib.widgets import Button
 from sklearn.mixture import GaussianMixture
 from sklearn.preprocessing import StandardScaler
 import spikeinterface as si
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-sortout_folder = Path(r"\\10.129.151.108\xieluanlabs\xl_cl\sortout\CnL42SG\CnL42SG_20260313")
+sortout_folder = Path(r"\\10.129.151.108\xieluanlabs\xl_cl\sortout\CnL42SG\CnL42SG_20260225")
 output_json = sortout_folder / "unit_labels.json"
 RUN_MERGE          = True   # set True to run merge pass after labeling
-REVIEW_AUTO        = False  # set True to open GUI for final review of auto-classified units
 OVERWRITE          = False   # set True to discard existing labels and re-classify from scratch
 LAUNCH_HTML_REVIEW = True   # set True to launch interactive HTML review after auto-curation
 
@@ -60,6 +56,11 @@ SUA_RP_THRESHOLD             = 0.1    # sliding refractory period violations (Ll
 SUA_AMPLITUDE_CUTOFF_THRESHOLD = 0.1  # amplitude cutoff (fraction of spikes clipped)
 
 ISI_THRESHOLD_MS             = 1.5    # biophysical refractory period used for ISI metric
+
+# Valid auto-curation labels. A unit already carrying one of these in the JSON
+# is treated as labeled and skipped on resume; any other value (empty string,
+# stale/unknown tag) is re-classified.
+VALID_LABELS = {"SUA", "MUA", "Noise"}
 
 # GMM sanity-check parameters (used in compute_and_label_units)
 GMM_N_COMPONENTS  = 3
@@ -183,6 +184,38 @@ def _normalize_qm_columns(df):
     return df.rename(columns=rename) if rename else df
 
 
+def _ptp_snr(sa) -> "pd.Series | None":
+    """
+    Peak-to-peak SNR: (max - min of template at best channel) / noise.
+    Handles both positive and negative spikes correctly.
+    Returns None if templates or noise_levels are not yet computed.
+    """
+    tmpl_ext  = sa.get_extension("templates")
+    noise_ext = sa.get_extension("noise_levels")
+    if tmpl_ext is None or noise_ext is None:
+        return None
+
+    templates    = tmpl_ext.get_data()    # (n_units, n_samples, n_channels)
+    noise_levels = noise_ext.get_data()   # (n_channels,)
+    unit_ids     = sa.sorting.get_unit_ids()
+    sparsity     = sa.sparsity
+
+    snrs = {}
+    for i, uid in enumerate(unit_ids):
+        tmpl = templates[i]               # (n_samples, n_channels)
+        if sparsity is not None:
+            ch_idx = sparsity.unit_id_to_channel_indices[uid]
+            tmpl   = tmpl[:, ch_idx]
+            noise  = noise_levels[ch_idx]
+        else:
+            noise  = noise_levels
+        ptp        = tmpl.max(axis=0) - tmpl.min(axis=0)
+        snr_per_ch = ptp / np.where(noise > 0, noise, np.inf)
+        snrs[uid]  = float(snr_per_ch.max())
+
+    return pd.Series(snrs)
+
+
 def _load_or_compute_qm(sa, isi_threshold_ms: float = ISI_THRESHOLD_MS):
     """
     Return a quality-metrics DataFrame for *sa* containing all _REQUIRED_METRICS.
@@ -214,6 +247,12 @@ def _load_or_compute_qm(sa, isi_threshold_ms: float = ISI_THRESHOLD_MS):
     # Llobet rp_contamination is derived from spike trains, not an SI metric
     if "rp_contamination" not in df.columns:
         df["rp_contamination"] = _compute_rp_contamination(sa, isi_threshold_ms)
+
+    # Override SI's SNR (default peak_sign="neg") with peak-to-peak SNR so
+    # positive-deflection units are not penalised.
+    ptp = _ptp_snr(sa)
+    if ptp is not None:
+        df["snr"] = ptp.reindex(df.index).values
 
     return df
 
@@ -341,17 +380,63 @@ def compute_bleed_flag(sa, unit_id) -> bool:
         return False
 
 
+def _json_default(o):
+    """JSON serializer for numpy scalars/arrays stored in the metrics dict."""
+    if isinstance(o, np.integer):
+        return int(o)
+    if isinstance(o, np.floating):
+        return float(o)
+    if isinstance(o, np.bool_):
+        return bool(o)
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    raise TypeError(f"Object of type {type(o).__name__} is not JSON serializable")
+
+
+def _metrics_cache_path(rec_name: str) -> Optional[Path]:
+    """
+    Path to the on-disk metrics cache for a recording — stored next to the
+    SortingAnalyzer it was derived from. Returns None if no sorting result
+    folder exists for the recording.
+    """
+    rec_dir = sortout_folder / rec_name
+    sorting_dirs = sorted(rec_dir.glob("sorting_results_*"))
+    if not sorting_dirs:
+        return None
+    return sorting_dirs[-1] / "metrics_cache.json"
+
+
 def load_metrics(rec_name: str) -> dict:
     """
     Load or compute all quality metrics for one recording.
     Returns dict: str(unit_id) -> {metric_name: value, ...}
 
-    Results are memory-cached so the analyzer is only loaded once per session.
-    The quality_metrics extension is also persisted inside the SortingAnalyzer
-    folder, so subsequent runs load instantly without recomputation.
+    Lookup order (fastest first):
+      1. In-process memory cache (`_metrics_cache`).
+      2. On-disk `metrics_cache.json` next to the analyzer — skips loading the
+         SortingAnalyzer entirely (no network read, no template/SNR/bleed/RP
+         recomputation). Bypassed when OVERWRITE is True.
+      3. Full compute from the SortingAnalyzer, then persisted to (2).
+
+    The final dict bundles the custom metrics (peak-to-peak SNR, Llobet
+    rp_contamination, bleed_flag) that are NOT part of the saved
+    quality_metrics extension and would otherwise be recomputed every run.
     """
     if rec_name in _metrics_cache:
         return _metrics_cache[rec_name]
+
+    # ── Fast path: read persisted metrics, skip analyzer load entirely ──────
+    cache_path = _metrics_cache_path(rec_name)
+    if cache_path is not None and cache_path.exists() and not OVERWRITE:
+        try:
+            with open(cache_path) as f:
+                result = json.load(f)
+            print(f"[Metrics] Loaded {len(result)} cached unit(s) for {rec_name} "
+                  f"(skipped analyzer load).")
+            _metrics_cache[rec_name] = result
+            return result
+        except Exception as e:
+            print(f"[Metrics] Cache read failed ({cache_path}): {e} — recomputing.")
 
     print(f"[Metrics] Loading metrics for {rec_name} ...")
     sa = _get_analyzer(rec_name)
@@ -370,6 +455,16 @@ def load_metrics(rec_name: str) -> dict:
 
         result = {str(uid): row.to_dict() for uid, row in df.iterrows()}
         print(f"[Metrics] Done — {len(result)} units for {rec_name}.")
+
+        # Persist so future runs skip the analyzer entirely.
+        if cache_path is not None:
+            try:
+                with open(cache_path, "w") as f:
+                    json.dump(result, f, indent=2, default=_json_default)
+                print(f"[Metrics] Cached → {cache_path}")
+            except Exception as e:
+                print(f"[Metrics] Could not write cache {cache_path}: {e}")
+
         _metrics_cache[rec_name] = result
         return result
 
@@ -380,47 +475,6 @@ def load_metrics(rec_name: str) -> dict:
 
 
 # ── Auto-classification logic ──────────────────────────────────────────────────
-def _get_reject_reasons(m: dict) -> list:
-    """
-    Return human-readable strings explaining why a unit was classified as Noise.
-    Empty list means no noise-gate criterion fired (unit is SUA or MUA).
-    """
-    reasons = []
-    snr = m.get("snr")
-    presence = m.get("presence_ratio")
-    if snr is not None and snr < NOISE_SNR_THRESHOLD:
-        reasons.append(f"snr={snr:.3f} < {NOISE_SNR_THRESHOLD}")
-    if presence is not None and presence < NOISE_PRESENCE_THRESHOLD:
-        reasons.append(f"presence_ratio={presence:.3f} < {NOISE_PRESENCE_THRESHOLD}")
-    isi = m.get("isi_violations_ratio")
-    if isi is not None and isi > NOISE_ISI_THRESHOLD:
-        reasons.append(f"isi={isi:.3f} > {NOISE_ISI_THRESHOLD}")
-    if m.get("bleed_flag", False):
-        reasons.append("bleed_flag triggered")
-    return reasons
-
-
-def _get_sua_failures(m: dict) -> list:
-    """
-    For a non-Noise unit, return which SUA gate conditions it failed.
-    Empty list means all SUA criteria passed (unit should be SUA, not MUA).
-    """
-    failures = []
-    checks = [
-        ("snr",                 m.get("snr",                 0),   ">=", SUA_SNR_THRESHOLD),
-        ("isi_violations_ratio",m.get("isi_violations_ratio",1),   "<",  SUA_ISI_RATIO_THRESHOLD),
-        ("firing_rate",         m.get("firing_rate",          0),  ">=", SUA_FIRING_RATE_MIN),
-        ("rp_contamination",    m.get("rp_contamination",     1),  "<",  SUA_RP_THRESHOLD),
-        ("amplitude_cutoff",    m.get("amplitude_cutoff",     1),  "<",  SUA_AMPLITUDE_CUTOFF_THRESHOLD),
-    ]
-    for name, val, op, thresh in checks:
-        if op == ">=" and val < thresh:
-            failures.append(f"{name}={val:.3f} (need >={thresh})")
-        elif op == "<" and val >= thresh:
-            failures.append(f"{name}={val:.3f} (need <{thresh})")
-    return failures
-
-
 def auto_classify(m: dict) -> str:
     """
     Three-tier classification from a quality-metrics dict.
@@ -459,116 +513,34 @@ def auto_classify(m: dict) -> str:
     return "MUA"
 
 
-# ── Auto-classification review GUI ────────────────────────────────────────────
-def review_auto_labels(auto_units: list, labels: dict, output_path: Path) -> dict:
-    """
-    Show every auto-classified unit (good + noise) for a final human check.
+def _get_reject_reasons(m: dict) -> list:
+    """Return list of noise-gate failure strings for a Noise unit."""
+    reasons = []
+    if m.get("snr", 0) < NOISE_SNR_THRESHOLD:
+        reasons.append(f"SNR {m.get('snr', 0):.2f} < {NOISE_SNR_THRESHOLD}")
+    if m.get("presence_ratio", 0) < NOISE_PRESENCE_THRESHOLD:
+        reasons.append(f"presence {m.get('presence_ratio', 0):.2f} < {NOISE_PRESENCE_THRESHOLD}")
+    if m.get("isi_violations_ratio", 0) > NOISE_ISI_THRESHOLD:
+        reasons.append(f"ISI {m.get('isi_violations_ratio', 0):.2f} > {NOISE_ISI_THRESHOLD}")
+    if m.get("bleed_flag", False):
+        reasons.append("bleed flag")
+    return reasons
 
-    auto_units : list of (rec_name, uid, img_path, metrics_dict, auto_decision)
 
-    For each unit the title shows:
-      • The auto decision (green = good, red = noise)
-      • Every criterion that triggered rejection (noise units only)
-      • All metric values vs. their thresholds
-    Buttons: Confirm (keep auto) | Good | MUA | Noise | Back | Skip
-    """
-    if not auto_units:
-        print("No auto-classified units to review.")
-        return labels
-
-    print(f"\n── Auto-label review: {len(auto_units)} units ────────────────────────")
-    state = {"idx": 0}
-    fig, ax = plt.subplots(figsize=(14, 9))
-    plt.subplots_adjust(bottom=0.14)
-
-    def fmt(val, decimals: int = 3, suffix: str = "") -> str:
-        if val is None:
-            return "n/a"
-        try:
-            return f"{float(val):.{decimals}f}{suffix}"
-        except (TypeError, ValueError):
-            return str(val)
-
-    def show_current():
-        ax.clear()
-        rec_name, uid, img_path, m, auto_dec = auto_units[state["idx"]]
-        img = mpimg.imread(str(img_path))
-        ax.imshow(img)
-        ax.set_axis_off()
-
-        if auto_dec == "Noise":
-            failures = _get_reject_reasons(m)
-            reason_line = ("  NOISE GATE: " + " | ".join(failures)) if failures else ""
-        elif auto_dec == "MUA":
-            failures = _get_sua_failures(m)
-            reason_line = ("  SUA failed: " + " | ".join(failures)) if failures else ""
-        else:
-            reason_line = ""
-        dec_color = "darkgreen" if auto_dec == "SUA" else ("darkorange" if auto_dec == "MUA" else "darkred")
-
-        line1 = (
-            f"[{rec_name}]  unit {uid}  ({state['idx'] + 1} / {len(auto_units)})  "
-            f"── AUTO: {auto_dec}{reason_line}"
-        )
-        line2 = (
-            f"SNR={fmt(m.get('snr'), 2)}  |  "
-            f"FR={fmt(m.get('firing_rate'), 3, ' Hz')}  |  "
-            f"ISI={fmt(m.get('isi_violations_ratio'), 4)}  |  "
-            f"RPCont={fmt(m.get('rp_contamination'), 4)}  |  "
-            f"AmpCut={fmt(m.get('amplitude_cutoff'), 3)}  |  "
-            f"Presence={fmt(m.get('presence_ratio'), 2)}  |  "
-            f"Bleed={'YES' if m.get('bleed_flag') else 'no'}"
-        )
-        ax.set_title(f"{line1}\n{line2}", fontsize=9, color=dec_color,
-                     loc="left", pad=6)
-        fig.canvas.draw_idle()
-
-    def _apply_label(label_value: str):
-        rec_name, uid, _, _, _ = auto_units[state["idx"]]
-        labels.setdefault(rec_name, {})[uid] = label_value
-        save_labels(labels, output_path)
-        state["idx"] += 1
-        if state["idx"] >= len(auto_units):
-            print("Auto-label review complete!")
-            plt.close(fig)
-        else:
-            show_current()
-
-    def on_confirm(_):
-        _, _, _, _, auto_dec = auto_units[state["idx"]]
-        _apply_label(auto_dec)
-
-    def on_back(_):
-        if state["idx"] > 0:
-            state["idx"] -= 1
-            show_current()
-
-    def on_skip(_):
-        state["idx"] += 1
-        if state["idx"] >= len(auto_units):
-            print("Reached end (some units skipped).")
-            plt.close(fig)
-        else:
-            show_current()
-
-    btn_specs = [
-        (0.05, "Confirm",  "lightblue",   on_confirm),
-        (0.22, "SUA",      "lightgreen",  lambda _: _apply_label("SUA")),
-        (0.35, "MUA",      "khaki",       lambda _: _apply_label("MUA")),
-        (0.48, "Noise",    "lightsalmon", lambda _: _apply_label("Noise")),
-        (0.66, "Back",     "lightgray",   on_back),
-        (0.79, "Skip",     "whitesmoke",  on_skip),
-    ]
-    buttons = []
-    for x, text, color, cb in btn_specs:
-        ax_btn = fig.add_axes([x, 0.02, 0.12, 0.06])
-        btn = Button(ax_btn, text, color=color, hovercolor="lightskyblue")
-        btn.on_clicked(cb)
-        buttons.append(btn)
-
-    show_current()
-    plt.show()
-    return labels
+def _get_sua_failures(m: dict) -> list:
+    """Return list of SUA criteria that a MUA unit failed."""
+    failures = []
+    if m.get("snr", 0) < SUA_SNR_THRESHOLD:
+        failures.append(f"SNR {m.get('snr', 0):.2f} < {SUA_SNR_THRESHOLD}")
+    if m.get("isi_violations_ratio", 1) >= SUA_ISI_RATIO_THRESHOLD:
+        failures.append(f"ISI {m.get('isi_violations_ratio', 1):.3f} ≥ {SUA_ISI_RATIO_THRESHOLD}")
+    if m.get("firing_rate", 0) < SUA_FIRING_RATE_MIN:
+        failures.append(f"FR {m.get('firing_rate', 0):.3f} Hz < {SUA_FIRING_RATE_MIN} Hz")
+    if m.get("rp_contamination", 1) >= SUA_RP_THRESHOLD:
+        failures.append(f"RP cont {m.get('rp_contamination', 1):.3f} ≥ {SUA_RP_THRESHOLD}")
+    if m.get("amplitude_cutoff", 1) >= SUA_AMPLITUDE_CUTOFF_THRESHOLD:
+        failures.append(f"amp cutoff {m.get('amplitude_cutoff', 1):.3f} ≥ {SUA_AMPLITUDE_CUTOFF_THRESHOLD}")
+    return failures
 
 
 # ── Merge pass (Wu et al. 2024, STAR Methods p.20) ────────────────────────────
@@ -731,43 +703,46 @@ def run_merge_pass(rec_name: str, good_unit_ids: list,
 
 # ── Matplotlib labeling GUI ────────────────────────────────────────────────────
 def label_units(units: list, labels: dict, output_path: Path,
-                run_merge: bool = False, review_auto: bool = False,
+                run_merge: bool = False,
                 run_html_review: bool = False) -> dict:
     """
     1. Auto-classify all unlabeled units (SUA / MUA / Noise).
-    2. Optional GUI review of all auto-classified units (review_auto=True).
-    3. Optionally run merge pass on SUA units.
-    4. Open GUI for any units that remain unlabeled after step 1.
+    2. Optionally run merge pass on SUA units.
+    3. Optionally launch HTML review.
     """
 
     # ── Stage 1: auto-classification ────────────────────────────────────────
     print("\n── Auto-classification pass ──────────────────────────────────────")
     counts: dict = {"SUA": 0, "MUA": 0, "Noise": 0}
-    auto_units = []  # (rec_name, uid, img_path, metrics_dict, decision)
 
-    for rec_name, uid, img_path in units:
-        m = load_metrics(rec_name).get(str(uid), {})
-
-        if rec_name in labels and uid in labels[rec_name]:
-            # Already labeled — queue for review if REVIEW_AUTO is on
-            if review_auto:
-                existing = labels[rec_name][uid]
-                auto_units.append((rec_name, uid, img_path, m, existing))
+    for rec_name, uid, _ in units:
+        # Skip already-labeled units BEFORE touching the analyzer — on a full
+        # resume this avoids loading metrics for every shank just to discard them.
+        # Only a valid SUA/MUA/Noise tag counts as labeled; any other value
+        # (empty, stale, unknown) falls through and is re-classified.
+        if labels.get(rec_name, {}).get(uid) in VALID_LABELS:
             continue
 
+        m = load_metrics(rec_name).get(str(uid), {})
         decision = auto_classify(m)
         labels.setdefault(rec_name, {})[uid] = decision
-        auto_units.append((rec_name, uid, img_path, m, decision))
         counts[decision] = counts.get(decision, 0) + 1
 
     save_labels(labels, output_path)
-    print(f"Auto-labeled:  {counts['SUA']} SUA,  {counts['MUA']} MUA,  {counts['Noise']} Noise.")
 
-    # ── Stage 2: optional auto-label review GUI ──────────────────────────────
-    if review_auto and auto_units:
-        labels = review_auto_labels(auto_units, labels, output_path)
+    # Report the full label distribution in the JSON (existing + this run), not
+    # just the units classified in this pass — on a resume `counts` is all zeros
+    # because every unit was already labeled.
+    totals = {"SUA": 0, "MUA": 0, "Noise": 0}
+    for rec in labels.values():
+        for lbl in rec.values():
+            if lbl in totals:
+                totals[lbl] += 1
+    new_this_run = counts["SUA"] + counts["MUA"] + counts["Noise"]
+    print(f"Labels:  {totals['SUA']} SUA,  {totals['MUA']} MUA,  {totals['Noise']} Noise  "
+          f"({new_this_run} newly labeled this run).")
 
-    # ── Stage 3: optional merge pass ────────────────────────────────────────
+    # ── Stage 2: optional merge pass ────────────────────────────────────────
     if run_merge:
         print("── Merge pass ────────────────────────────────────────────────────")
         merge_json = output_path.parent / "unit_merge_map.json"
@@ -942,12 +917,13 @@ if __name__ == "__main__":
         print("OVERWRITE=True — discarding existing labels, re-classifying from scratch.")
     else:
         labels = load_labels(output_json)
-        already = sum(len(v) for v in labels.values())
+        already = sum(1 for rec in labels.values()
+                      for lbl in rec.values() if lbl in VALID_LABELS)
         if already:
             print(f"Resuming — {already} units already labeled, "
                   f"{len(units) - already} remaining.")
 
     labels = label_units(units, labels, output_json,
-                         run_merge=RUN_MERGE, review_auto=REVIEW_AUTO,
+                         run_merge=RUN_MERGE,
                          run_html_review=LAUNCH_HTML_REVIEW)
     print(f"\nLabels saved → {output_json}")

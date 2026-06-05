@@ -1,6 +1,8 @@
 import os
+import sys
 import time
 import json
+import contextlib
 import traceback
 from pathlib import Path
 import matplotlib
@@ -19,71 +21,132 @@ from spikesorting.artifact_utils import (detect_artifacts_recording,
                                           LazyArtifactRepairRecording)
 
 
+class _Tee:
+    """Duplicate every write to several streams (e.g. console + log file)."""
+
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, data):
+        for s in self._streams:
+            s.write(data)
+            s.flush()
+        return len(data)
+
+    def flush(self):
+        for s in self._streams:
+            s.flush()
+
+
+@contextlib.contextmanager
+def _log_to_file(log_path):
+    """Tee stdout+stderr into ``log_path`` for the duration of the context.
+
+    Everything printed (diagnostics, timing reports, tracebacks) still shows
+    on the console and is additionally captured to the log file, so each
+    shank's run leaves a self-contained record next to its results.
+    """
+    log_path = Path(log_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_file = open(log_path, 'w', encoding='utf-8')
+    orig_out, orig_err = sys.stdout, sys.stderr
+    sys.stdout = _Tee(orig_out, log_file)
+    sys.stderr = _Tee(orig_err, log_file)
+    try:
+        yield
+    finally:
+        sys.stdout, sys.stderr = orig_out, orig_err
+        log_file.close()
+
+
 def _load_or_compute_artifacts(rec, out_folder, sorter_params):
     """
     Return (rec_repaired, artifact_timestamps).
 
-    On first run: detects artifacts (reads recording once), saves tiny per-channel
-    timestamp arrays to out_folder/_artifact_cache/ (a few KB total), then wraps
-    the recording in a LazyArtifactRepairRecording — no memmap, no disk write.
-    On subsequent runs: loads cached timestamps instantly and skips detection.
-    Cache is invalidated if detection params or recording shape changes.
+    Detects artifacts on first run, caches per-channel timestamp arrays
+    keyed by a hash of detection params + recording shape, and wraps the
+    recording in a LazyArtifactRepairRecording — no memmap, no disk write.
+
+    Each distinct param combination gets its own cache file
+    (``artifact_timestamps_<hash>.npz`` + ``cache_meta_<hash>.json``) so
+    flipping a knob (e.g. ``artifact_global_stats_sample_batches``) and back
+    reuses the prior cache instead of triggering a full re-detection.
     """
+    import hashlib
+
     cache_dir = Path(out_folder) / '_artifact_cache'
-    meta_path = cache_dir / 'cache_meta.json'
-    ts_path   = cache_dir / 'artifact_timestamps.npz'
 
     current_meta = {
-        'detection_method': 'rolling_std',
-        'rolling_window_size': 100,
-        'rolling_z_threshold': 30,
+        'detection_method': sorter_params.get('artifact_detection_method', 'rolling_std'),
+        'slope_threshold': sorter_params.get('artifact_slope_threshold', 500),
+        'rolling_window_size': sorter_params.get('artifact_rolling_window_size', 100),
+        'rolling_z_threshold': sorter_params.get('artifact_rolling_z_threshold', 30),
         'time_batch_sec': sorter_params.get('artifact_time_batch_sec', 600),
+        'use_global_stats': sorter_params.get('artifact_use_global_stats', True),
+        'global_stats_sample_batches': sorter_params.get('artifact_global_stats_sample_batches', None),
         'n_samples': int(rec.get_num_frames()),
         'n_channels': int(rec.get_num_channels()),
         'sampling_rate': float(rec.get_sampling_frequency()),
     }
+    key_str = json.dumps(current_meta, sort_keys=True)
+    key = hashlib.sha1(key_str.encode()).hexdigest()[:12]
+    meta_path = cache_dir / f'cache_meta_{key}.json'
+    ts_path   = cache_dir / f'artifact_timestamps_{key}.npz'
 
     if meta_path.exists() and ts_path.exists():
         with open(meta_path) as f:
             cached_meta = json.load(f)
         if cached_meta == current_meta:
-            print("1. Cache hit — loading artifact timestamps, skipping detection...")
+            print(f"1. Cache hit ({key}) — loading artifact timestamps, "
+                  f"skipping detection...")
             n_channels = current_meta['n_channels']
             ts_data = np.load(str(ts_path), allow_pickle=True)
             artifact_timestamps = [ts_data[f'ch_{i:03d}'] for i in range(n_channels)]
         else:
-            print("1. Cache params mismatch — rerunning artifact detection...")
+            # Hash collision (essentially impossible) — recompute.
+            print(f"1. Cache file for {key} exists but meta differs — rerunning detection...")
             artifact_timestamps = None
     else:
-        print("1. No cache — running artifact detection and saving timestamps...")
+        existing = sorted(cache_dir.glob('cache_meta_*.json')) if cache_dir.exists() else []
+        if existing:
+            print(f"1. No cache for current params ({key}); "
+                  f"{len(existing)} other cached config(s) present. Running detection...")
+        else:
+            print("1. No cache — running artifact detection and saving timestamps...")
         artifact_timestamps = None
 
     if artifact_timestamps is None:
         artifact_timestamps = detect_artifacts_recording(
             rec,
             detection_method=current_meta['detection_method'],
+            slope_threshold=current_meta['slope_threshold'],
             rolling_window_size=current_meta['rolling_window_size'],
             rolling_z_threshold=current_meta['rolling_z_threshold'],
             time_batch_sec=current_meta['time_batch_sec'],
+            use_global_stats=current_meta['use_global_stats'],
+            global_stats_sample_batches=current_meta['global_stats_sample_batches'],
         )
         cache_dir.mkdir(parents=True, exist_ok=True)
         with open(meta_path, 'w') as f:
             json.dump(current_meta, f, indent=2)
         ts_save = {f'ch_{i:03d}': ts for i, ts in enumerate(artifact_timestamps)}
         np.savez(str(ts_path), **ts_save)
+        print(f"   Saved cache → {ts_path.name}")
 
     rec_repaired = LazyArtifactRepairRecording(rec, artifact_timestamps, dither=True)
     return rec_repaired, artifact_timestamps, current_meta
 
 
-def _sort_shank(rec, out_folder, sorter_params, folder_name, shank,
+def _sort_shank(rec, out_folder, sort_out_folder, sorter_params, folder_name, shank,
                 remove_artifacts=True):
     """
     Preprocessing + MountainSort5 for a single shank.
 
+    ``out_folder`` holds the per-shank artifact cache; ``sort_out_folder`` is
+    the (already created) timestamped results folder for this run.
+
     Returns (sorting_analyzer, sort_out_folder).
-    Metrics are intentionally excluded so they can run in a background thread
-    while the next shank sorts.
+    Metrics are computed separately via _compute_metrics after this returns.
     """
     print("Recording:", rec)
 
@@ -153,12 +216,8 @@ def _sort_shank(rec, out_folder, sorter_params, folder_name, shank,
     total_samples = traces_preproc.size
     print(f"Threshold crossings in sample: {threshold_crossings} / {total_samples} ({100*threshold_crossings/total_samples:.3f}%)")
 
-    # === PREPARE OUTPUT FOLDER ===
+    # === OUTPUT FOLDER (created by caller; results land here) ===
     scheme = str(sorter_params.get('scheme', '1'))
-    current_time = time.strftime("%Y%m%d_%H%M", time.localtime())
-    results_folder_name = f"sorting_results_{current_time}_scheme{scheme}"
-    sort_out_folder = out_folder / results_folder_name
-    sort_out_folder.mkdir(parents=True, exist_ok=True)
 
     # Save artifact timestamps
     if artifact_timestamps is not None:
@@ -306,7 +365,7 @@ def _sort_shank(rec, out_folder, sorter_params, folder_name, shank,
         folder=str(analyzer_folder)
     )
     print("Sorting analyzer:", sorting_analyzer)
-    print(f"\n=== Shank {shank} sorting complete — submitting metrics to background ===")
+    print(f"\n=== Shank {shank} sorting complete ===")
 
     return sorting_analyzer, sort_out_folder
 
@@ -356,7 +415,8 @@ def _compute_metrics(sorting_analyzer, sort_out_folder, n_jobs=1):
 
 
 def main(rec_folder=None, sorter_params=None, shanks=None, animal_id="", sortout=None,
-         remove_artifacts=True, n_jobs=1):
+         remove_artifacts=True, n_jobs=1, direct_sort=False, device_type=None,
+         impedance_path=None):
     """
     Main spike sorting function.
 
@@ -376,6 +436,15 @@ def main(rec_folder=None, sorter_params=None, shanks=None, animal_id="", sortout
         Whether to run artifact detection and repair (default True)
     n_jobs : int
         Number of parallel workers for metrics computation
+    direct_sort : bool
+        If True, build the per-shank recording directly from .rec files
+        (no NWB step). If False (default), read the existing per-shank NWB.
+    device_type : str, optional
+        Probe mapping CSV stem under rec2nwb/mapping/ (e.g. "8shank32").
+        Only used when direct_sort=True. If omitted, falls back to looking
+        up animal_id in rec2nwb/device_types.json.
+    impedance_path : str or Path, optional
+        Optional impedance CSV (only honoured when direct_sort=True).
     """
     # Default parameters if none provided
     if shanks is None:
@@ -401,33 +470,79 @@ def main(rec_folder=None, sorter_params=None, shanks=None, animal_id="", sortout
     rec_folder = Path(rec_folder)
     _, session_id, folder_name = parse_session_info(str(rec_folder))
 
-    for shank in shanks:
-        nwb_folder = rec_folder / f"{folder_name}sh{shank}.nwb"
-        if not nwb_folder.exists():
-            print(f"NWB file not found: {nwb_folder}")
-            continue
+    # --- Direct-sort prep (only when enabled) ---
+    if direct_sort:
+        from rec2nwb.direct_recording import build_sortable_recording
+        from rec2nwb.utils.file_io import load_bad_ch
+        if device_type is None:
+            # Fall back to the persisted animal_id → device_type map.
+            dt_map_path = Path(__file__).resolve().parent.parent / "rec2nwb" / "device_types.json"
+            if dt_map_path.exists():
+                with open(dt_map_path, "r") as _f:
+                    _dt_map = json.load(_f)
+                device_type = _dt_map.get(animal_id)
+            if device_type is None:
+                raise ValueError(
+                    f"device_type not provided and animal_id={animal_id!r} not found in "
+                    f"{dt_map_path}. Add the entry or set 'device_type' in the JSON config."
+                )
+            print(f"[direct_sort] device_type for {animal_id!r} resolved from "
+                  f"device_types.json -> {device_type}")
+        bad_ch_ids = load_bad_ch(rec_folder / "bad_channels.txt")
+        impedance_path_obj = Path(impedance_path) if impedance_path else None
+        print(f"\n[MODE] direct_sort=True  device_type={device_type}")
+    else:
+        print("\n[MODE] direct_sort=False (reading per-shank NWB)")
 
+    for shank in shanks:
         out_folder = Path(sortout) / animal_id / \
             f"{animal_id}_{session_id}" / f"shank{shank}"
         out_folder.mkdir(parents=True, exist_ok=True)
 
-        rec = se.NwbRecordingExtractor(str(nwb_folder))
+        if direct_sort:
+            try:
+                rec = build_sortable_recording(
+                    data_folder=rec_folder,
+                    shank=shank,
+                    device_type=device_type,
+                    impedance_path=impedance_path_obj,
+                    bad_ch_ids=bad_ch_ids,
+                )
+            except Exception as e:
+                print(f"build_sortable_recording failed for shank {shank}: {e}")
+                traceback.print_exc()
+                continue
+        else:
+            nwb_folder = rec_folder / f"{folder_name}sh{shank}.nwb"
+            if not nwb_folder.exists():
+                print(f"NWB file not found: {nwb_folder}")
+                continue
+            rec = se.read_nwb_recording(str(nwb_folder))
 
-        try:
-            sorting_analyzer, sort_out_folder = _sort_shank(
-                rec=rec,
-                out_folder=out_folder,
-                sorter_params=sorter_params,
-                folder_name=folder_name,
-                shank=shank,
-                remove_artifacts=remove_artifacts,
-            )
-        except Exception as e:
-            print(f"Sorting failed for shank {shank}: {e}")
-            traceback.print_exc()
-            continue
+        # Create the timestamped results folder up front so the whole run
+        # (sorting + metrics) can be logged into it.
+        scheme = str(sorter_params.get('scheme', '1'))
+        current_time = time.strftime("%Y%m%d_%H%M", time.localtime())
+        sort_out_folder = out_folder / f"sorting_results_{current_time}_scheme{scheme}"
+        sort_out_folder.mkdir(parents=True, exist_ok=True)
 
-        _compute_metrics(sorting_analyzer, sort_out_folder, n_jobs)
+        with _log_to_file(sort_out_folder / "sorting_log.txt"):
+            try:
+                sorting_analyzer, sort_out_folder = _sort_shank(
+                    rec=rec,
+                    out_folder=out_folder,
+                    sort_out_folder=sort_out_folder,
+                    sorter_params=sorter_params,
+                    folder_name=folder_name,
+                    shank=shank,
+                    remove_artifacts=remove_artifacts,
+                )
+            except Exception as e:
+                print(f"Sorting failed for shank {shank}: {e}")
+                traceback.print_exc()
+                continue
+
+            _compute_metrics(sorting_analyzer, sort_out_folder, n_jobs)
 
     print("\nAll shanks complete.")
 
@@ -437,12 +552,26 @@ def process_from_json(json_file="MSSortingFiles.json"):
 
     JSON format:
     {
-        "recordings": [
-            {"path": "/path/to/folder", "shanks": [0, 1], "animal_id": "M001"}
-        ],
         "sortout": "/path/to/output",
-        "sorter_params": {...}
+        "sorter_params": {...},
+        "direct_sort": false,        # optional global default (default False)
+        "recordings": [
+            {
+                "path": "/path/to/folder",
+                "shanks": [0, 1],
+                "animal_id": "M001",
+                "direct_sort": true,        # optional per-recording override
+                "device_type": "8shank32",  # optional; auto-looked up from
+                                            # rec2nwb/device_types.json by
+                                            # animal_id if omitted
+                "impedance_path": null      # optional
+            }
+        ]
     }
+
+    direct_sort=False (default): reads pre-built per-shank NWB files.
+    direct_sort=True: builds the per-shank recording directly from .rec files
+    via rec2nwb.direct_recording.build_sortable_recording (skips NWB write).
     """
 
     # Get the directory where this script is located
@@ -462,6 +591,7 @@ def process_from_json(json_file="MSSortingFiles.json"):
         raise ValueError("'sortout' key is required in the JSON config")
 
     global_n_jobs = config.get('n_jobs', 1)
+    global_direct_sort = config.get('direct_sort', False)
 
     # Process each recording
     for i, rec in enumerate(config['recordings'], 1):
@@ -474,6 +604,9 @@ def process_from_json(json_file="MSSortingFiles.json"):
         shanks = rec['shanks']
         remove_artifacts = rec.get('remove_artifacts', True)
         n_jobs = rec.get('n_jobs', global_n_jobs)
+        direct_sort = rec.get('direct_sort', global_direct_sort)
+        device_type = rec.get('device_type')
+        impedance_path = rec.get('impedance_path')
 
         print(f"\n{'='*60}")
         print(f"[{i}/{len(config['recordings'])}] Processing: {rec_folder.name}")
@@ -483,6 +616,8 @@ def process_from_json(json_file="MSSortingFiles.json"):
         print(f"  Threshold: {sorter_params.get('detect_threshold', 5.5)}")
         print(f"  Remove artifacts: {remove_artifacts}")
         print(f"  n_jobs: {n_jobs}")
+        print(f"  direct_sort: {direct_sort}"
+              + (f" (device_type={device_type})" if direct_sort else ""))
         print(f"{'='*60}")
 
         try:
@@ -492,7 +627,10 @@ def process_from_json(json_file="MSSortingFiles.json"):
                  animal_id=animal_id,
                  sortout=sortout,
                  remove_artifacts=remove_artifacts,
-                 n_jobs=n_jobs)
+                 n_jobs=n_jobs,
+                 direct_sort=direct_sort,
+                 device_type=device_type,
+                 impedance_path=impedance_path)
         except Exception as e:
             print(f"ERROR processing {rec_folder.name}: {e}")
             traceback.print_exc()
