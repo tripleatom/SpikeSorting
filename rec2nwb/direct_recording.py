@@ -376,3 +376,135 @@ def build_sortable_recording(
               f"{n_frames} frames ({n_frames / fs:.1f} s)")
 
     return sliced
+
+
+def build_sortable_recording_intan(
+    data_folder: Path,
+    shank: int,
+    device_type: str,
+    impedance_path: Path | None = None,
+    bad_ch_ids: list | None = None,
+    verbose: bool = True,
+) -> BaseRecording:
+    """Return a per-shank SpikeInterface recording sourced directly from Intan files.
+
+    Intan (``.rhd``/``.rhs``) analogue of :func:`build_sortable_recording`. Mirrors
+    the channel/electrode setup that ``intan2nwb.EphysToNWBConverter`` writes into a
+    per-shank NWB, minus the disk write: every ``.rhd``/``.rhs`` part in
+    ``data_folder`` is opened, concatenated in time, sliced to the shank's good
+    channels, and given probe geometry.
+
+    Unlike the SpikeGadgets path there is no packet-loss gap interpolation — Intan
+    recordings have no ``.rec`` packet-loss ``.txt`` sidecars, so parts are simply
+    concatenated.
+
+    Parameters
+    ----------
+    data_folder : Path
+        Folder containing one or more ``*.rhd``/``*.rhs`` files (the layout consumed
+        by ``intan2nwb``). Multiple files are concatenated in sorted (time) order.
+    shank : int
+        Shank index.
+    device_type : str
+        Mapping CSV stem under ``rec2nwb/mapping/`` (e.g. ``"4shank16intan"``).
+    impedance_path : Path, optional
+        Optional impedance CSV whose ``Channel Name`` column supplies channel IDs
+        (e.g. ``"A-000"``) to select, mirroring the NWB pipeline. **Not required:**
+        when omitted, channels are selected by native position — the mapping CSV's
+        row order is the Intan native channel order, so ``channel_index`` indexes the
+        recording directly.
+    bad_ch_ids : list, optional
+        Channel names to exclude (matches what ``load_bad_ch`` returns). With an
+        impedance CSV these are the impedance ``Channel Name`` values (e.g.
+        ``"A-005"``); without one they are the mapping's ``"chN"`` names where ``N``
+        is the Intan channel index.
+    verbose : bool
+        Print a short summary.
+
+    Returns
+    -------
+    BaseRecording
+        Ready to feed into ``MsSorting._sort_shank``.
+    """
+    data_folder = Path(data_folder)
+
+    # --- Discover parts ---
+    data_files = get_data_files(data_folder, 'intan')
+    if verbose:
+        print(f"Direct-sort (intan): {len(data_files)} part(s) for shank {shank} "
+              f"in {data_folder}")
+
+    # --- Electrode table for this shank ---
+    channel_index, xcoord, ycoord = get_ch_index_on_shank(shank, device_type)
+    impedance_table = pd.read_csv(impedance_path) if impedance_path else None
+    electrode_df = build_electrode_df(
+        channel_index, xcoord, ycoord, 'intan',
+        impedance_table, bad_ch_ids,
+    )
+    if verbose:
+        print(f"  Good electrodes on shank {shank}: {len(electrode_df)}")
+
+    # --- Open each part and concatenate in time (no gap interpolation for Intan) ---
+    parts = [se.read_intan(str(f), stream_id='0') for f in data_files]
+    full_rec = parts[0] if len(parts) == 1 else si.concatenate_recordings(parts)
+
+    # --- Slice to good channels for this shank ---
+    actual_ids = list(full_rec.get_channel_ids())
+
+    if impedance_table is not None:
+        # Impedance CSV supplies channel names ("A-000"-style); match them against
+        # the recording's IDs, mirroring the intan2nwb -> NWB pipeline exactly.
+        good_ids = resolve_good_channel_ids(
+            electrode_df, 'intan', has_impedance=True,
+            actual_channel_ids=full_rec.get_channel_ids(),
+        )
+        good_str_ids = [str(i) for i in good_ids]
+        actual_set = set(map(str, actual_ids))
+        missing = [c for c in good_str_ids if c not in actual_set]
+        if missing:
+            raise ValueError(
+                f"{len(missing)} channel(s) for shank {shank} not found in the Intan "
+                f"recording (e.g. {missing[:5]}). The recording's channel IDs look "
+                f"like {sorted(actual_set)[:3]}. The impedance CSV's 'Channel Name' "
+                f"values must match the recording IDs, or device_type={device_type!r} "
+                f"is the wrong mapping."
+            )
+        # electrode_df rows are already in good_ids order; reindex defensively so
+        # probe positions[i] line up with the sliced recording's channel order.
+        ed_ordered = (electrode_df.set_index('channel_name')
+                      .loc[good_str_ids].reset_index())
+    else:
+        # No impedance file: select by NATIVE POSITION. The mapping CSV's row order
+        # is the Intan native channel order, so channel_index indexes the recording
+        # directly — no channel-name matching (and thus no impedance CSV) needed.
+        positions = electrode_df['channel_index'].to_numpy()
+        n_rec = len(actual_ids)
+        oob = positions[(positions < 0) | (positions >= n_rec)]
+        if len(oob):
+            raise ValueError(
+                f"Channel index/indices {list(oob[:5])} on shank {shank} are out of "
+                f"range for this {n_rec}-channel Intan recording. device_type="
+                f"{device_type!r} likely doesn't match this recording."
+            )
+        good_ids = [actual_ids[p] for p in positions]
+        good_str_ids = [str(i) for i in good_ids]
+        # electrode_df is already in selection order (positions order).
+        ed_ordered = electrode_df.reset_index(drop=True)
+        if verbose:
+            print(f"  No impedance CSV — selecting {len(good_ids)} channel(s) by "
+                  f"native position; recording IDs look like {good_str_ids[:3]}")
+
+    sliced = full_rec.select_channels(channel_ids=good_ids)
+
+    # --- Attach probe geometry ---
+    # select_channels preserves the given order, so positions[i] <-> good_ids[i].
+    probe = _make_probe(ed_ordered, good_str_ids)
+    sliced = sliced.set_probe(probe, in_place=False)
+
+    if verbose:
+        fs = sliced.get_sampling_frequency()
+        n_frames = sliced.get_num_frames()
+        print(f"  Built recording: {sliced.get_num_channels()} ch, "
+              f"{n_frames} frames ({n_frames / fs:.1f} s)")
+
+    return sliced
