@@ -416,7 +416,7 @@ def _compute_metrics(sorting_analyzer, sort_out_folder, n_jobs=1):
 
 def main(rec_folder=None, sorter_params=None, shanks=None, animal_id="", sortout=None,
          remove_artifacts=True, n_jobs=1, direct_sort=False, device_type=None,
-         impedance_path=None):
+         impedance_path=None, source_format=None):
     """
     Main spike sorting function.
 
@@ -444,7 +444,13 @@ def main(rec_folder=None, sorter_params=None, shanks=None, animal_id="", sortout
         Only used when direct_sort=True. If omitted, falls back to looking
         up animal_id in rec2nwb/device_types.json.
     impedance_path : str or Path, optional
-        Optional impedance CSV (only honoured when direct_sort=True).
+        Optional impedance CSV (only honoured when direct_sort=True). For Intan it
+        supplies channel IDs via its 'Channel Name' column; if omitted, Intan
+        channels are selected by native position (no impedance file needed).
+    source_format : str, optional
+        Recording format for direct sort: "spikegadgets" (.rec) or "intan"
+        (.rhd/.rhs). Only used when direct_sort=True. If omitted, inferred from
+        device_type (names ending in "intan" -> "intan", else "spikegadgets").
     """
     # Default parameters if none provided
     if shanks is None:
@@ -472,7 +478,8 @@ def main(rec_folder=None, sorter_params=None, shanks=None, animal_id="", sortout
 
     # --- Direct-sort prep (only when enabled) ---
     if direct_sort:
-        from rec2nwb.direct_recording import build_sortable_recording
+        from rec2nwb.direct_recording import (build_sortable_recording,
+                                              build_sortable_recording_intan)
         from rec2nwb.utils.file_io import load_bad_ch
         if device_type is None:
             # Fall back to the persisted animal_id → device_type map.
@@ -490,7 +497,15 @@ def main(rec_folder=None, sorter_params=None, shanks=None, animal_id="", sortout
                   f"device_types.json -> {device_type}")
         bad_ch_ids = load_bad_ch(rec_folder / "bad_channels.txt")
         impedance_path_obj = Path(impedance_path) if impedance_path else None
-        print(f"\n[MODE] direct_sort=True  device_type={device_type}")
+        # Resolve recording format: explicit override, else infer from device_type.
+        if source_format is None:
+            source_format = 'intan' if str(device_type).endswith('intan') else 'spikegadgets'
+        source_format = str(source_format).lower()
+        if source_format not in ('spikegadgets', 'intan'):
+            raise ValueError(
+                f"source_format must be 'spikegadgets' or 'intan', got {source_format!r}")
+        print(f"\n[MODE] direct_sort=True  device_type={device_type}  "
+              f"source_format={source_format}")
     else:
         print("\n[MODE] direct_sort=False (reading per-shank NWB)")
 
@@ -500,8 +515,10 @@ def main(rec_folder=None, sorter_params=None, shanks=None, animal_id="", sortout
         out_folder.mkdir(parents=True, exist_ok=True)
 
         if direct_sort:
+            builder = (build_sortable_recording_intan if source_format == 'intan'
+                       else build_sortable_recording)
             try:
-                rec = build_sortable_recording(
+                rec = builder(
                     data_folder=rec_folder,
                     shank=shank,
                     device_type=device_type,
@@ -509,7 +526,7 @@ def main(rec_folder=None, sorter_params=None, shanks=None, animal_id="", sortout
                     bad_ch_ids=bad_ch_ids,
                 )
             except Exception as e:
-                print(f"build_sortable_recording failed for shank {shank}: {e}")
+                print(f"{builder.__name__} failed for shank {shank}: {e}")
                 traceback.print_exc()
                 continue
         else:
@@ -564,14 +581,23 @@ def process_from_json(json_file="MSSortingFiles.json"):
                 "device_type": "8shank32",  # optional; auto-looked up from
                                             # rec2nwb/device_types.json by
                                             # animal_id if omitted
-                "impedance_path": null      # optional
+                "source_format": "intan",   # optional; "spikegadgets" or "intan".
+                                            # Inferred from device_type if omitted.
+                "impedance_path": null      # optional (intan selects by native
+                                            # position when omitted)
             }
         ]
     }
 
     direct_sort=False (default): reads pre-built per-shank NWB files.
-    direct_sort=True: builds the per-shank recording directly from .rec files
-    via rec2nwb.direct_recording.build_sortable_recording (skips NWB write).
+    direct_sort=True: builds the per-shank recording directly from raw files
+    (skips NWB write):
+      - source_format="spikegadgets" (.rec) ->
+        rec2nwb.direct_recording.build_sortable_recording
+      - source_format="intan" (.rhd/.rhs) ->
+        rec2nwb.direct_recording.build_sortable_recording_intan
+    ``source_format`` may be set globally or per-recording; if omitted it is
+    inferred from device_type (names ending in "intan" -> intan).
     """
 
     # Get the directory where this script is located
@@ -607,6 +633,7 @@ def process_from_json(json_file="MSSortingFiles.json"):
         direct_sort = rec.get('direct_sort', global_direct_sort)
         device_type = rec.get('device_type')
         impedance_path = rec.get('impedance_path')
+        source_format = rec.get('source_format', config.get('source_format'))
 
         print(f"\n{'='*60}")
         print(f"[{i}/{len(config['recordings'])}] Processing: {rec_folder.name}")
@@ -617,7 +644,8 @@ def process_from_json(json_file="MSSortingFiles.json"):
         print(f"  Remove artifacts: {remove_artifacts}")
         print(f"  n_jobs: {n_jobs}")
         print(f"  direct_sort: {direct_sort}"
-              + (f" (device_type={device_type})" if direct_sort else ""))
+              + (f" (device_type={device_type}, source_format={source_format or 'auto'})"
+                 if direct_sort else ""))
         print(f"{'='*60}")
 
         try:
@@ -630,7 +658,8 @@ def process_from_json(json_file="MSSortingFiles.json"):
                  n_jobs=n_jobs,
                  direct_sort=direct_sort,
                  device_type=device_type,
-                 impedance_path=impedance_path)
+                 impedance_path=impedance_path,
+                 source_format=source_format)
         except Exception as e:
             print(f"ERROR processing {rec_folder.name}: {e}")
             traceback.print_exc()
