@@ -83,7 +83,12 @@ def resolve_good_channel_ids(electrode_df: pd.DataFrame, recording_method: str,
             good_ids.append(idx)
         return good_ids
 
-    if has_impedance or recording_method == 'intan':
+    if recording_method == 'intan':
+        if not has_impedance and actual_channel_ids is not None:
+            return [actual_channel_ids[i] for i in electrode_df['channel_index'].tolist()]
+        return electrode_df['channel_name'].tolist()
+
+    if has_impedance:
         return electrode_df['channel_name'].tolist()
 
     return electrode_df['channel_index'].tolist()

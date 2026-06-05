@@ -258,6 +258,13 @@ class EphysToNWBConverter:
         electrode_location = metadata.get("electrode_location", None)
         first_file = data_files[0]
 
+        # --- Recording info (once, from first file) ---
+        print("\nGetting recording information...")
+        recording, sampling_freq, num_frames, conversion, offset = \
+            self._get_recording_info(first_file)
+        self._last_sampling_freq = sampling_freq
+        actual_ch_ids = recording.get_channel_ids()
+
         # --- Per-shank electrode setup ---
         impedance_table = pd.read_csv(impedance_path) if impedance_path else None
         shank_setups = {}
@@ -270,6 +277,7 @@ class EphysToNWBConverter:
             good_ids = resolve_good_channel_ids(
                 electrode_df, self.recording_method,
                 has_impedance=(impedance_table is not None),
+                actual_channel_ids=actual_ch_ids,
             )
             print(f"Shank {ish}: {len(electrode_df)} good electrodes")
             shank_setups[ish] = {
@@ -292,12 +300,6 @@ class EphysToNWBConverter:
             shank_setups[ish]['col_indices'] = [
                 ch_to_col[str(ch)] for ch in shank_setups[ish]['good_channel_ids']
             ]
-
-        # --- Recording info (once, from first file) ---
-        print("\nGetting recording information...")
-        recording, sampling_freq, num_frames, conversion, offset = \
-            self._get_recording_info(first_file)
-        self._last_sampling_freq = sampling_freq
 
         chunk_frames = int(self.chunk_duration * sampling_freq)
         est_gb = self._estimate_gb(num_frames, len(all_channel_ids))
