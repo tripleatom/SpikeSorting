@@ -181,6 +181,8 @@ def _sort_shank(rec, out_folder, sort_out_folder, sorter_params, folder_name, sh
     print(f"[TIMING] Step 1 artifact detection/cache: {time.time() - _t0:.2f}s")
 
     # 2. Common median reference (CMR)
+    if rec_rm_artifacts.get_dtype().kind == 'u':
+        rec_rm_artifacts = sp.unsigned_to_signed(rec_rm_artifacts)
     print("2. Applying common median reference (CMR)...")
     rec_cmr = sp.common_reference(rec_rm_artifacts, reference='global', operator='median')
 
