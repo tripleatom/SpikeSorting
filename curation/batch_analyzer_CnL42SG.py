@@ -48,7 +48,7 @@ from plan_status import stamp, update_status
 CSV_PATH    = _HERE / "curation_record" / "CnL42SG_260122_260325_curation_plan.csv"
 LOG_DIR     = _HERE / "curation_record" / "build_logs"
 STATUS_COL  = "analyzer_status"
-TOP_SORTOUT = Path(r"\\10.129.151.108\xieluanlabs\xl_cl\sortout")
+TOP_SORTOUT = Path(r"\\10.129.151.88\xieluanlabs2\xl_cl\sortout")
 ANIMAL_ID   = "CnL42SG"
 
 N_JOBS                = 24        # worker pool size for ONE session's build

@@ -66,7 +66,7 @@ from matplotlib.patches import Patch
 # Base output folder — must match match_units_CnL42SG.OUTPUT_FOLDER. The actual
 # results live in a threshold-named subfolder under here (e.g. thres_0.70).
 OUTPUT_FOLDER_BASE = Path(
-    r"\\10.129.151.108\xieluanlabs\xl_cl\sortout\CnL42SG\unit_match_all_pairs"
+    r"\\10.129.151.88\xieluanlabs2\xl_cl\sortout\CnL42SG\unit_match_all_pairs"
 )
 
 # Threshold of the match run to read. Set THRES to the value you passed to

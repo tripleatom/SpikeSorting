@@ -86,7 +86,7 @@ from curation_lazy import (
 )
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-_DEFAULT_SORTOUT = Path(r"\\10.129.151.108\xieluanlabs\xl_cl\sortout\CnL43\CnL43_20260408")
+_DEFAULT_SORTOUT = Path(r"\\10.129.151.88\xieluanlabs2\xl_cl\sortout\CnL43\CnL43_20260408")
 
 
 def _sortout_from_env_or_default() -> Path:

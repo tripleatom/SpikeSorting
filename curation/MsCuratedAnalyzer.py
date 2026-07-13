@@ -39,8 +39,8 @@ from rec2nwb.preproc_func import parse_session_info
 from rec2nwb.utils.file_io import load_bad_ch
 
 # ── Configuration (edit when running directly) ─────────────────────────────────
-rec_folder     = Path(r"\\10.129.151.108\xieluanlabs\xl_cl\experiment_data\CnL42\260304\CnL42SG_20260304")  # folder containing the per-shank NWB recordings; also used to parse animal/session ID if not provided explicitly")
-sortout_folder = Path(r"\\10.129.151.108\xieluanlabs\xl_cl\sortout")
+rec_folder     = Path(r"F:\SNr1\SNr1_20260610")  # folder containing the per-shank NWB recordings; also used to parse animal/session ID if not provided explicitly")
+sortout_folder = Path(r"\\10.129.151.88\xieluanlabs2\xl_cl\sortout")
 shanks         = [0,1,2,3,4,5,6,7]  # list of shanks to process; set empty to auto-detect from rec_folder
 n_jobs         = 24
 overwrite      = True

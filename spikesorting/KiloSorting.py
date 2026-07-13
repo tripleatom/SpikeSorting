@@ -40,7 +40,7 @@ class NWBLazyArray:
 # Configuration
 # ============================================================
 nwb_path = r"F:\CnL42SG\CnL42SG_20260325\CnL42SG_20260325sh7.nwb"
-sortout   = r"\\10.129.151.108\xieluanlabs\xl_cl\sortout"
+sortout   = r"\\10.129.151.88\xieluanlabs2\xl_cl\sortout"
 
 kilosort_params = {
     'batch_size': 60000,  # default=60000; increase to use more GPU memory per batch
