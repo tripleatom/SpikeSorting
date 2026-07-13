@@ -25,7 +25,7 @@ _HERE = Path(__file__).resolve().parent
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 ANIMAL_ID   = "CnL42SG"
-SORTOUT_TOP = Path(r"\\10.129.151.108\xieluanlabs\xl_cl\sortout")
+SORTOUT_TOP = Path(r"\\10.129.151.88\xieluanlabs2\xl_cl\sortout")
 # Raw recording drives in *preference order* — earlier wins when both match.
 # Keep the trailing slash: Path("G:") is drive-*relative* ("G:CnL42SG"), while
 # Path("G:/") anchors to the drive root ("G:\CnL42SG").

@@ -84,7 +84,7 @@ CSV_PATH = _HERE / "curation_record" / "CnL42SG_260122_260325_curation_plan.csv"
 # Where the matching outputs go. Defaults to a folder next to the sessions on
 # the sortout share so the results live with the data.
 OUTPUT_FOLDER = Path(
-    r"\\10.129.151.108\xieluanlabs\xl_cl\sortout\CnL42SG\unit_match_all_pairs"
+    r"\\10.129.151.88\xieluanlabs2\xl_cl\sortout\CnL42SG\unit_match_all_pairs"
 )
 
 # Eligible curated labels (curated_analyzer has already removed Noise). The

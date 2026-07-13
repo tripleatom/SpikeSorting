@@ -31,7 +31,7 @@ from sklearn.preprocessing import StandardScaler
 import spikeinterface as si
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-sortout_folder = Path(r"\\10.129.151.108\xieluanlabs\xl_cl\sortout\CnL42SG\CnL42SG_20260225")
+sortout_folder = Path(r"\\10.129.151.88\xieluanlabs2\xl_cl\sortout\SNr1\SNr1_20260610")
 output_json = sortout_folder / "unit_labels.json"
 RUN_MERGE          = True   # set True to run merge pass after labeling
 OVERWRITE          = False   # set True to discard existing labels and re-classify from scratch

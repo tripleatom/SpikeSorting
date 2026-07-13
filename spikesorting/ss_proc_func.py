@@ -1,7 +1,7 @@
 from pathlib import Path
 
 
-def get_sortout_folder(default_sortout=r"\\10.129.151.108\xieluanlabs\xl_cl\sortout"):
+def get_sortout_folder(default_sortout=r"\\10.129.151.88\xieluanlabs2\xl_cl\sortout"):
     """Get and validate the sortout folder path."""
     
     print(f"\nDefault output folder: {default_sortout}")
