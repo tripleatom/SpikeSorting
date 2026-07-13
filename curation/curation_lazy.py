@@ -31,10 +31,10 @@ from sklearn.preprocessing import StandardScaler
 import spikeinterface as si
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-sortout_folder = Path(r"\\10.129.151.108\xieluanlabs\xl_cl\sortout\CnL42SG\CnL42SG_20260225")
+sortout_folder = Path(r"/Volumes/xieluanlabs2/xl_cl/sortout/CnL45/CnL45_2_260709_030844")
 output_json = sortout_folder / "unit_labels.json"
 RUN_MERGE          = True   # set True to run merge pass after labeling
-OVERWRITE          = False   # set True to discard existing labels and re-classify from scratch
+OVERWRITE          = True   # set True to discard existing labels and re-classify from scratch
 LAUNCH_HTML_REVIEW = True   # set True to launch interactive HTML review after auto-curation
 
 # ── Auto-curation thresholds ───────────────────────────────────────────────────
@@ -293,6 +293,26 @@ def _compute_rp_contamination(sa, t_rp_ms: float = ISI_THRESHOLD_MS) -> "pd.Seri
     return pd.Series(values, name="rp_contamination")
 
 
+def _strip_appledouble(folder: Path) -> int:
+    """
+    Remove macOS AppleDouble sidecar files (``._*``) under *folder*.
+
+    On SMB/network shares macOS drops a ``._<name>`` resource-fork file next to
+    every real file. Inside a SortingAnalyzer's ``extensions/`` dir this yields a
+    bogus ``._quality_metrics`` entry that SpikeInterface treats as an extension
+    and fails to load (``No such file or directory: '._params.json'``), which
+    silently reduces the whole shank to the all-MUA fallback. Sweep them first.
+    """
+    removed = 0
+    for junk in folder.rglob("._*"):
+        try:
+            junk.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
 def _get_analyzer(rec_name: str) -> Optional[object]:
     """Load and cache the SortingAnalyzer for a recording."""
     if rec_name in _analyzer_cache:
@@ -304,6 +324,9 @@ def _get_analyzer(rec_name: str) -> Optional[object]:
     analyzer_folder = sorting_dirs[-1] / "sorting_analyzer"
     if not analyzer_folder.is_dir():
         return None
+    n_junk = _strip_appledouble(analyzer_folder)
+    if n_junk:
+        print(f"[Analyzer] Removed {n_junk} AppleDouble (._*) file(s) from {rec_name}.")
     try:
         sa = si.load_sorting_analyzer(str(analyzer_folder))
         _analyzer_cache[rec_name] = sa
