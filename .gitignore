@@ -4,6 +4,7 @@ build
 *.ipynb
 .DS_Store
 *.json
+!rec2nwb/device_types.json
 *.egg-info
 benchmark_results
 .claude
