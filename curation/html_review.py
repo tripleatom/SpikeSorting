@@ -106,12 +106,18 @@ merge_json     = sortout_folder / "unit_merge_map.json"
 def configure_sortout(path: str | Path | None) -> None:
     """Point review I/O at a session or animal folder (contains shank* / sorting_results_*)."""
     global sortout_folder, output_json, output_html, merge_json
-    if path is None:
-        return
-    sortout_folder = Path(path).expanduser().resolve()
-    output_json = sortout_folder / "unit_labels.json"
-    output_html = sortout_folder / "review.html"
-    merge_json = sortout_folder / "unit_merge_map.json"
+    if path is not None:
+        sortout_folder = Path(path).expanduser().resolve()
+        output_json = sortout_folder / "unit_labels.json"
+        output_html = sortout_folder / "review.html"
+        merge_json = sortout_folder / "unit_merge_map.json"
+
+    # Keep curation_lazy's module-level sortout in sync so run_merge_pass (which
+    # resolves analyzers via curation_lazy.sortout_folder) reads this same session,
+    # even when no explicit path was passed (falls back to this module's default).
+    import curation_lazy
+    curation_lazy.sortout_folder = sortout_folder
+    curation_lazy._analyzer_cache.clear()
 
 
 # ── Analyzer / metrics ────────────────────────────────────────────────────────
@@ -213,6 +219,21 @@ def _compute_correlogram(st_a: np.ndarray, st_b: np.ndarray, fs: float,
     return centers.tolist(), counts.tolist()
 
 
+def _template_centroid(template: np.ndarray, ch_locs: np.ndarray) -> np.ndarray:
+    """
+    Amplitude-weighted channel centroid of a template — the same distance basis
+    used by the auto-merge decision in curation_lazy.run_merge_pass (get_centroid).
+    Kept identical here so the preview's distance pass/fail matches what actually
+    drove the merge, rather than the primary-channel distance used previously.
+
+    template : (n_samples, n_channels)   ch_locs : (n_channels, 2)
+    """
+    p2p     = template.max(axis=0) - template.min(axis=0)   # (n_channels,)
+    total   = p2p.sum()
+    weights = p2p / total if total > 0 else np.ones(len(p2p)) / len(p2p)
+    return (ch_locs * weights[:, None]).sum(axis=0)
+
+
 def _compute_merge_preview(rec_name: str, uid_a_str: str, uid_b_str: str) -> dict:
     """
     Compute everything needed by the merge preview panel:
@@ -289,7 +310,8 @@ def _compute_merge_preview(rec_name: str, uid_a_str: str, uid_b_str: str) -> dic
     amp_b    = float(p2p_b[pri_b])
     amp_ratio = float(max(amp_a, amp_b) / (min(amp_a, amp_b) + 1e-9))
 
-    dist = float(np.linalg.norm(ch_locs[pri_a] - ch_locs[pri_b]))
+    dist = float(np.linalg.norm(_template_centroid(tmpl_a, ch_locs)
+                                - _template_centroid(tmpl_b, ch_locs)))
 
     st_merged   = np.sort(np.concatenate([st_a, st_b]))
     isi_merged  = _isi_ratio_from_spike_train(st_merged, fs)
@@ -373,6 +395,7 @@ def _compute_merge_group_preview(rec_name: str, uid_strs: list) -> dict:
     p2p_comb     = sum(p2ps)
     pri_combined = int(p2p_comb.argmax())
     ch_locs      = sa.get_channel_locations()
+    centroids    = [_template_centroid(templates[idx], ch_locs) for idx in idxs]
     dists        = np.linalg.norm(ch_locs - ch_locs[pri_combined], axis=1)
     top_chs      = np.argsort(dists)[:3]    # primary + 2 nearest
     time_ms  = ((np.arange(n_samp) - n_samp // 2) / fs * 1000.0).tolist()
@@ -415,7 +438,7 @@ def _compute_merge_group_preview(rec_name: str, uid_strs: list) -> dict:
             amp_a     = float(p2ps[i][pri_chs[i]])
             amp_b     = float(p2ps[j][pri_chs[j]])
             amp_ratio = float(max(amp_a, amp_b) / (min(amp_a, amp_b) + 1e-9))
-            dist      = float(np.linalg.norm(ch_locs[pri_chs[i]] - ch_locs[pri_chs[j]]))
+            dist      = float(np.linalg.norm(centroids[i] - centroids[j]))
 
             st_merged  = np.sort(np.concatenate([spike_trains[i], spike_trains[j]]))
             isi_merged = _isi_ratio_from_spike_train(st_merged, fs)
@@ -512,6 +535,7 @@ def _compute_candidates(rec_name: str, group_uid_strs: list, n: int = 15) -> dic
     cent_p2p  = centroid.max(0) - centroid.min(0)
     cent_pri  = int(cent_p2p.argmax())
     cent_amp  = float(cent_p2p[cent_pri])
+    cent_ctr  = _template_centroid(centroid, ch_locs)   # amplitude-weighted centroid
 
     idx_set = set(idxs)
     candidates = []
@@ -523,7 +547,7 @@ def _compute_candidates(rec_name: str, group_uid_strs: list, n: int = 15) -> dic
         p2p       = tmpl.max(0) - tmpl.min(0)
         pri       = int(p2p.argmax())
         amp       = float(p2p[pri])
-        dist      = float(np.linalg.norm(ch_locs[pri] - ch_locs[cent_pri]))
+        dist      = float(np.linalg.norm(_template_centroid(tmpl, ch_locs) - cent_ctr))
         pr        = float(pearsonr(cent_flat, flat)[0]) \
                     if np.std(cent_flat) > 0 and np.std(flat) > 0 else 0.0
         amp_ratio = float(max(amp, cent_amp) / (min(amp, cent_amp) + 1e-9))
@@ -896,7 +920,24 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     border-bottom: 1px solid #ddd;
     font-size: 12px;
     color: #555;
+    display: flex;
+    align-items: center;
+    gap: 10px;
   }
+  .remerge-btn {
+    margin-left: auto;
+    background: var(--merge-color);
+    color: #fff;
+    border: none;
+    padding: 5px 14px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 600;
+    flex-shrink: 0;
+  }
+  .remerge-btn:hover { opacity: 0.88; }
+  .remerge-btn:disabled { background: #bbb; cursor: default; opacity: 1; }
   #merge-pairs-scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 12px; }
   #merge-pairs-empty { display: none; padding: 40px 20px; text-align: center; color: #888; font-size: 14px; }
   .mpair-card {
@@ -1041,6 +1082,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     color: #c62828; border-radius: 3px; padding: 2px 7px;
     font-size: 10px; font-weight: 600; cursor: pointer; flex-shrink: 0; }
   .unmerge-auto-btn:hover { background: #ffebee; }
+  /* ── Per-unit remove (×) inside an auto-merge group badge ── */
+  .mgroup-uid-remove { cursor: pointer; color: #c62828; font-weight: 700;
+    margin-left: 2px; font-size: 11px; opacity: 0.5; }
+  .mgroup-uid-remove:hover { opacity: 1; }
 </style>
 </head>
 <body>
@@ -1090,6 +1135,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div style="font-size:11px;color:#666;line-height:1.8;">
       <b>&#8592; &#8594;</b> = prev / next card<br>
       <b>Space</b> = select for merge<br>
+      <b>Q</b> = clear merge selection<br>
       <b>Esc</b> = close lightbox / preview
     </div>
   </div>
@@ -1384,6 +1430,45 @@ function _collectLabels() {
   return out;
 }
 
+// Effective label (manual override, else auto-classification) for every unit —
+// what the remerge pass uses to decide which units are non-noise (SUA/MUA).
+function _collectEffectiveLabels() {
+  const out = {};
+  UNITS.forEach(u => {
+    if (!out[u.rec]) out[u.rec] = {};
+    out[u.rec][u.uid] = u.label || u.auto;
+  });
+  return out;
+}
+
+// Re-run the auto-merge pass on the server using current labels, then refresh
+// the Auto-merged groups in place. Manually unmerged pairs stay blacklisted.
+function runRemerge() {
+  if (!SERVER_MODE) { alert('Remerge requires the server: run  python html_review.py --serve'); return; }
+  if (!confirm('Re-run the auto-merge pass?\n\nThis recomputes all auto-merged groups from the current labels and overwrites the existing auto groups. Units you relabeled to SUA/MUA become eligible; Noise units are excluded; pairs you manually unmerged stay excluded.')) return;
+  const btn = document.getElementById('remerge-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Remerging…'; }
+  fetch('/api/remerge', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ labels: _collectEffectiveLabels() }),
+  })
+    .then(r => r.json())
+    .then(data => {
+      if (data.error) { alert('Remerge failed: ' + data.error); return; }
+      // AUTO_MERGES is const — mutate in place.
+      for (const k of Object.keys(AUTO_MERGES)) delete AUTO_MERGES[k];
+      const groups = normalizeInitMerges(data.auto_groups || {});
+      for (const [rec, gs] of Object.entries(groups)) AUTO_MERGES[rec] = gs;
+      renderMergePairsPage();
+    })
+    .catch(() => alert('Remerge request failed.'))
+    .finally(() => {
+      const b = document.getElementById('remerge-btn');
+      if (b) { b.disabled = false; b.textContent = 'Remerge'; }
+    });
+}
+
 // ── Merge mode ─────────────────────────────────────────────────────────────────
 function getMergeGroupIdx(rec, uid) {
   return (mergeGroups[rec] || []).findIndex(g => g.includes(uid));
@@ -1455,6 +1540,8 @@ function updateMergePendingUI() {
 
 function clearMergeSelect() {
   mergeSelected.length = 0;
+  document.querySelectorAll('#grid .card.merge-sel')
+          .forEach(card => card.classList.remove('merge-sel'));
   updateMergePendingUI();
 }
 
@@ -1566,6 +1653,62 @@ function unmergeAutoGroup(rec, uids) {
   }).catch(err => console.error('unmerge-auto failed:', err));
 }
 
+// Update the "Auto merged (N groups)" section header after group count changes.
+function _refreshAutoMergedHeader() {
+  const autoCount = Object.values(AUTO_MERGES).reduce((s, gs) => s + gs.length, 0);
+  const hdr = [...document.querySelectorAll('#merge-pairs-scroll .merge-section-header')]
+    .find(h => h.textContent.startsWith('Auto merged'));
+  if (hdr) {
+    if (autoCount === 0) hdr.remove();
+    else hdr.textContent = `Auto merged  (${autoCount} group${autoCount !== 1 ? 's' : ''})`;
+  }
+}
+
+// Remove a single unit from one auto-merged group, keeping the rest merged.
+// Dissolves the group if fewer than 2 units would remain. The server blacklists
+// the removed unit against its former group-mates so a later Remerge won't
+// re-absorb it (the remaining units can still merge with each other).
+function removeUnitFromAutoGroup(rec, groupUids, uid) {
+  if (!SERVER_MODE) return;
+  const groups = AUTO_MERGES[rec];
+  if (!groups) return;
+  const gi = groups.findIndex(g =>
+    g.length === groupUids.length && groupUids.every(u => g.includes(u)));
+  if (gi < 0) return;
+
+  const remaining = groups[gi].filter(u => u !== uid);
+  const dissolved = remaining.length < 2;
+
+  // 1. Update in-memory model
+  if (dissolved) groups.splice(gi, 1);
+  else           groups[gi] = remaining;
+  if (groups.length === 0) delete AUTO_MERGES[rec];
+
+  // 2. Update DOM surgically (preserve scroll position)
+  const scroll = document.getElementById('merge-pairs-scroll');
+  if (scroll) {
+    const oldCard = [...scroll.querySelectorAll('.mpair-card[data-uids]')]
+      .find(c => c.dataset.rec === rec && c.dataset.uids === groupUids.join(','));
+    if (oldCard) {
+      if (dissolved) {
+        oldCard.remove();
+        _refreshAutoMergedHeader();
+      } else {
+        const newCard = _buildAutoMergeGroupCard(rec, remaining);
+        oldCard.replaceWith(newCard);
+        if (_mergePairsIO) _mergePairsIO.observe(newCard);
+      }
+    }
+  }
+
+  // 3. Persist to disk (optimistic update)
+  fetch('/api/remove-from-auto', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ rec, remove: uid }),
+  }).catch(err => console.error('remove-from-auto failed:', err));
+}
+
 function updateMergeGroupsDisplay() {
   const el = document.getElementById('merge-groups-list');
   let html = '';
@@ -1589,6 +1732,12 @@ document.addEventListener('keydown', e => {
     return;
   }
   if (e.key === 'Escape') { closeMergePreview(); return; }
+  if ((e.key === 'q' || e.key === 'Q') && mergeMode) {
+    clearMergeSelect();
+    closeMergePreview();
+    e.preventDefault();
+    return;
+  }
   if (focusIdx < 0 || focusIdx >= visibleCards.length) return;
   const card = visibleCards[focusIdx];
   const rec = card.dataset.rec, uid = card.dataset.uid;
@@ -2267,9 +2416,16 @@ function _buildAutoMergeGroupCard(rec, group) {
   card.dataset.rec  = rec;
   card.dataset.uids = group.join(',');
 
-  const uidBadges = group.map((uid, k) =>
-    `<span style="color:${GROUP_COLORS[k%GROUP_COLORS.length]};font-weight:700;">u${uid}</span>`
-  ).join(' <span style="color:#aaa">\u2295</span> ');
+  const uidsCsv = group.join(',');
+  const uidBadges = group.map((uid, k) => {
+    const col = GROUP_COLORS[k % GROUP_COLORS.length];
+    const rm = SERVER_MODE
+      ? `<span class="mgroup-uid-remove" data-rec="${rec}" data-uids="${uidsCsv}" data-uid="${uid}"
+               title="Remove u${uid} from this group"
+               onclick="event.stopPropagation();removeUnitFromAutoGroup(this.dataset.rec,this.dataset.uids.split(','),this.dataset.uid)">&times;</span>`
+      : '';
+    return `<span class="mgroup-uid-badge" style="color:${col};font-weight:700;">u${uid}${rm}</span>`;
+  }).join(' <span style="color:#aaa">\u2295</span> ');
 
   if (SERVER_MODE) {
     card.innerHTML = `
@@ -2427,17 +2583,23 @@ function renderMergePairsPage() {
   const autoGroupCount = Object.values(AUTO_MERGES).reduce((s, gs) => s + gs.length, 0);
   const userPairs = allMergedUnitPairs();
 
+  const remergeBtn = SERVER_MODE
+    ? `<button id="remerge-btn" class="remerge-btn" onclick="runRemerge()"
+               title="Re-run the auto-merge pass on current labels">Remerge</button>`
+    : '';
+
   if (autoGroupCount === 0 && userPairs.length === 0) {
-    toolbar.textContent = '';
+    toolbar.innerHTML = `<span>No merge groups yet.</span>${remergeBtn}`;
     empty.style.display = 'block';
     return;
   }
   empty.style.display = 'none';
   toolbar.innerHTML =
-    `<b>${autoGroupCount}</b> auto-merged group${autoGroupCount !== 1 ? 's' : ''}` +
+    `<span><b>${autoGroupCount}</b> auto-merged group${autoGroupCount !== 1 ? 's' : ''}` +
     ` &nbsp;|&nbsp; ` +
     `<b>${userPairs.length}</b> potential pair${userPairs.length !== 1 ? 's' : ''}` +
-    (SERVER_MODE ? ' &nbsp;\u2014 scroll to load previews' : '');
+    (SERVER_MODE ? ' &nbsp;\u2014 scroll to load previews' : '') +
+    `</span>${remergeBtn}`;
 
   if (SERVER_MODE) {
     _mergePairsIO = new IntersectionObserver(entries => {
@@ -2695,8 +2857,109 @@ def launch_server(
                 with open(merge_json, "w") as f:
                     json.dump(existing, f, indent=2)
                 self._send(200, "application/json", b'{"ok":true}')
+            elif self.path == "/api/remerge":
+                self._handle_remerge()
+            elif self.path == "/api/remove-from-auto":
+                self._handle_remove_from_auto()
             else:
                 self.send_error(404)
+
+        def _handle_remove_from_auto(self):
+            """Remove one unit from its auto-merged group, keeping the rest merged.
+            Blacklists the removed unit against each former group-mate (pairwise, so
+            the survivors can still merge with each other). Dissolves the group if
+            fewer than two units remain."""
+            length = int(self.headers.get("Content-Length", 0))
+            body   = json.loads(self.rfile.read(length)) if length else {}
+            rec    = body.get("rec", "")
+            remove = str(body.get("remove", ""))
+            if not (rec and remove):
+                self._send(400, "application/json", b'{"error":"missing rec or remove"}')
+                return
+
+            existing = json.load(open(merge_json)) if merge_json.exists() else {}
+            if not any(k in existing for k in ("auto", "user", "blacklist")):
+                existing = {"auto": existing, "user": {}, "blacklist": {}}
+            auto_map = existing.get("auto", {})
+            rec_map  = auto_map.get(rec, {})
+
+            # Group this rec's members by canonical id.
+            canon_to_members: dict = {}
+            for uid, canon in rec_map.items():
+                canon_to_members.setdefault(str(canon), []).append(str(uid))
+
+            former_mates: list = []
+            new_groups:   list = []
+            for _canon, members in canon_to_members.items():
+                if remove in members:
+                    former_mates = [m for m in members if m != remove]
+                    members = former_mates
+                if len(members) >= 2:
+                    new_groups.append(members)
+
+            # Rebuild this rec's auto map from the surviving groups.
+            new_rec_map: dict = {}
+            for group in new_groups:
+                c = group[0]
+                for uid in group:
+                    new_rec_map[uid] = c
+            if new_rec_map:
+                auto_map[rec] = new_rec_map
+            elif rec in auto_map:
+                del auto_map[rec]
+            existing["auto"] = auto_map
+
+            # Blacklist removed-vs-each-former-mate so a later remerge won't re-add it.
+            bl = existing.setdefault("blacklist", {})
+            bl.setdefault(rec, [])
+            for other in former_mates:
+                pair = sorted([remove, other])
+                if pair not in bl[rec]:
+                    bl[rec].append(pair)
+
+            with open(merge_json, "w") as f:
+                json.dump(existing, f, indent=2)
+            self._send(200, "application/json", b'{"ok":true}')
+
+        def _handle_remerge(self):
+            """Re-run the auto-merge pass on the labels sent by the client, overwrite
+            the 'auto' section of the merge file, and return the new groups. Respects
+            the blacklist so manually unmerged pairs are never re-merged."""
+            from curation_lazy import run_merge_pass
+
+            length    = int(self.headers.get("Content-Length", 0))
+            body      = json.loads(self.rfile.read(length)) if length else {}
+            labels_in = body.get("labels", {})
+
+            # Load merge file, normalising the legacy flat-auto format.
+            existing = json.load(open(merge_json)) if merge_json.exists() else {}
+            if not any(k in existing for k in ("auto", "user", "blacklist")):
+                existing = {"auto": existing, "user": {}, "blacklist": {}}
+            blacklist = existing.get("blacklist", {})
+
+            try:
+                merge_results = {}
+                for rec_name, rec_labels in labels_in.items():
+                    good_ids = [uid for uid, lbl in rec_labels.items()
+                                if lbl in ("SUA", "MUA")]
+                    if good_ids:
+                        merge_results[rec_name] = run_merge_pass(
+                            rec_name, good_ids,
+                            blacklist=blacklist.get(rec_name, []),
+                        )
+            except Exception as e:
+                self._send(500, "application/json",
+                           json.dumps({"error": str(e)}).encode("utf-8"))
+                return
+
+            existing["auto"] = merge_results
+            with open(merge_json, "w") as f:
+                json.dump(existing, f, indent=2)
+
+            groups  = _merge_map_to_groups(merge_results)
+            payload = json.dumps({"ok": True, "auto_groups": groups},
+                                 separators=(',', ':')).encode("utf-8")
+            self._send(200, "application/json", payload)
 
         def _handle_preview(self):
             parsed = urlparse(self.path)

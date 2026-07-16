@@ -35,12 +35,18 @@ import spikeinterface.extractors as se
 import spikeinterface.preprocessing as sp
 from spikeinterface import create_sorting_analyzer
 from spikeinterface.core import aggregate_channels, aggregate_units, ChannelSparsity
+# Ensure this repo's root is imported before any similarly-named package that a
+# sibling project (e.g. ContinualLearning/rec2nwb) may have put on the path.
+# When run as `python curation/MsCuratedAnalyzer.py`, sys.path[0] is curation/,
+# not the repo root, so `import rec2nwb` would otherwise pick up the wrong copy.
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from rec2nwb.preproc_func import parse_session_info
 from rec2nwb.utils.file_io import load_bad_ch
 
 # ── Configuration (edit when running directly) ─────────────────────────────────
-rec_folder     = Path(r"F:\SNr1\SNr1_20260610")  # folder containing the per-shank NWB recordings; also used to parse animal/session ID if not provided explicitly")
-sortout_folder = Path(r"\\10.129.151.88\xieluanlabs2\xl_cl\sortout")
+rec_folder     = Path(r"/Volumes/xieluanlabs2/xl_cl/zebra_noise/CnL43_20260623/CnL43_20260623_133122.rec")  # folder containing the per-shank NWB recordings; also used to parse animal/session ID if not provided explicitly")
+sortout_folder = Path(r"/Volumes/xieluanlabs2/xl_cl/sortout")
 shanks         = [0,1,2,3,4,5,6,7]  # list of shanks to process; set empty to auto-detect from rec_folder
 n_jobs         = 24
 overwrite      = True
@@ -485,6 +491,15 @@ def main(rec_folder, shanks, sortout_folder, animal_id="", overwrite=False, n_jo
         animal_id = animal_id_parsed
 
     session_folder = Path(sortout_folder) / animal_id / f"{animal_id}_{session_id}"
+    if not session_folder.exists():
+        # Some sessions' sortout folders are named date-only (no _HHMMSS time
+        # suffix) while the .rec name carries the time. Fall back to that form.
+        date_only = session_id.split("_")[0]
+        alt = Path(sortout_folder) / animal_id / f"{animal_id}_{date_only}"
+        if alt.exists():
+            print(f"Session folder {session_folder.name!r} not found; using "
+                  f"date-only folder {alt.name!r}.")
+            session_folder = alt
     if output_folder is None:
         output_folder = session_folder / "curated_analyzer"
     else:
@@ -716,4 +731,4 @@ if __name__ == "__main__":
     else:
         # No JSON config — fall back to the top-level variables above
         main(rec_folder, shanks, sortout_folder, overwrite=_ow or overwrite, n_jobs=n_jobs,
-             z_offsets=z_offsets or None)
+             z_offsets=z_offsets or None, use_cache=USE_CACHE)

@@ -31,10 +31,10 @@ from sklearn.preprocessing import StandardScaler
 import spikeinterface as si
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-sortout_folder = Path(r"/Volumes/xieluanlabs2/xl_cl/sortout/CnL45/CnL45_2_260709_030844")
+sortout_folder = Path(r"/Volumes/xieluanlabs2/xl_cl/sortout/CnL43/CnL43_20260623")
 output_json = sortout_folder / "unit_labels.json"
 RUN_MERGE          = True   # set True to run merge pass after labeling
-OVERWRITE          = True   # set True to discard existing labels and re-classify from scratch
+OVERWRITE          = False   # set True to discard existing labels and re-classify from scratch
 LAUNCH_HTML_REVIEW = True   # set True to launch interactive HTML review after auto-curation
 
 # ── Auto-curation thresholds ───────────────────────────────────────────────────
@@ -46,7 +46,7 @@ LAUNCH_HTML_REVIEW = True   # set True to launch interactive HTML review after a
 # Noise gate — either condition fires → Noise
 NOISE_SNR_THRESHOLD          = 3.0    # below this → Noise
 NOISE_PRESENCE_THRESHOLD     = 0.5    # below this → Noise (unit not stable)
-NOISE_ISI_THRESHOLD          = 2   # ISI violations ratio above this → Noise
+NOISE_ISI_THRESHOLD          = 3.0    # ISI violations ratio above this → Noise
 
 # SUA gate — ALL conditions must pass
 SUA_SNR_THRESHOLD            = 5.0    # Allen/IBL convention
@@ -313,15 +313,34 @@ def _strip_appledouble(folder: Path) -> int:
     return removed
 
 
-def _get_analyzer(rec_name: str) -> Optional[object]:
-    """Load and cache the SortingAnalyzer for a recording."""
-    if rec_name in _analyzer_cache:
-        return _analyzer_cache[rec_name]
+def _latest_sorting_dir(rec_name: str) -> Optional[Path]:
+    """
+    Latest ``sorting_results_*`` folder for a recording that actually contains a
+    ``sorting_analyzer``.
+
+    Plain ``sorted(...)[-1]`` is wrong when a newer-named but empty/incomplete
+    run exists (e.g. a re-sort that only wrote a ``sorting_results_*`` shell with
+    no analyzer): it would pick that folder, ``_get_analyzer`` would find no
+    analyzer, and every metric would silently show n/a. Prefer the newest folder
+    that has an analyzer, falling back to the plain latest so callers that only
+    need the path still get one.
+    """
     rec_dir = sortout_folder / rec_name
     sorting_dirs = sorted(rec_dir.glob("sorting_results_*"))
     if not sorting_dirs:
         return None
-    analyzer_folder = sorting_dirs[-1] / "sorting_analyzer"
+    with_analyzer = [d for d in sorting_dirs if (d / "sorting_analyzer").is_dir()]
+    return with_analyzer[-1] if with_analyzer else sorting_dirs[-1]
+
+
+def _get_analyzer(rec_name: str) -> Optional[object]:
+    """Load and cache the SortingAnalyzer for a recording."""
+    if rec_name in _analyzer_cache:
+        return _analyzer_cache[rec_name]
+    sorting_dir = _latest_sorting_dir(rec_name)
+    if sorting_dir is None:
+        return None
+    analyzer_folder = sorting_dir / "sorting_analyzer"
     if not analyzer_folder.is_dir():
         return None
     n_junk = _strip_appledouble(analyzer_folder)
@@ -422,11 +441,10 @@ def _metrics_cache_path(rec_name: str) -> Optional[Path]:
     SortingAnalyzer it was derived from. Returns None if no sorting result
     folder exists for the recording.
     """
-    rec_dir = sortout_folder / rec_name
-    sorting_dirs = sorted(rec_dir.glob("sorting_results_*"))
-    if not sorting_dirs:
+    sorting_dir = _latest_sorting_dir(rec_name)
+    if sorting_dir is None:
         return None
-    return sorting_dirs[-1] / "metrics_cache.json"
+    return sorting_dir / "metrics_cache.json"
 
 
 def load_metrics(rec_name: str) -> dict:
