@@ -44,17 +44,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from rec2nwb.preproc_func import parse_session_info
 from rec2nwb.utils.file_io import load_bad_ch
 
-# ── Configuration (edit when running directly) ─────────────────────────────────
-rec_folder     = Path(r"/Volumes/xieluanlabs2/xl_cl/zebra_noise/CnL43_20260623/CnL43_20260623_133122.rec")  # folder containing the per-shank NWB recordings; also used to parse animal/session ID if not provided explicitly")
-sortout_folder = Path(r"/Volumes/xieluanlabs2/xl_cl/sortout")
-shanks         = [0,1,2,3,4,5,6,7]  # list of shanks to process; set empty to auto-detect from rec_folder
-n_jobs         = 24
-overwrite      = True
-USE_CACHE      = False     # write temp binary (True) vs compute on lazy recording (False)
-# z_offsets: set per-shank z coordinate (µm) when two probes share identical
-# x/y geometry (e.g. two 4-shank probes implanted at different depths).
-# Shanks from the same probe get the same z; leave as {} for a single probe.
-z_offsets      = {0: 0, 1: 0, 2: 0, 3: 0, 4: 500, 5: 500, 6: 500, 7: 500}
+# ── Configuration ───────────────────────────────────────────────────────────────
+# This script always runs from curated_analyzer_files.json (next to this file).
+# Edit that JSON to set rec_folder/sortout/shanks/animal_id/z_offsets/etc. --
+# do NOT add hardcoded config variables here, they will be ignored.
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -726,9 +719,11 @@ if __name__ == "__main__":
     import sys
     _ow = "--overwrite" in sys.argv
     _cfg_path = Path(__file__).parent / "curated_analyzer_files.json"
-    if _cfg_path.exists():
-        process_from_json(overwrite=_ow or None)
-    else:
-        # No JSON config — fall back to the top-level variables above
-        main(rec_folder, shanks, sortout_folder, overwrite=_ow or overwrite, n_jobs=n_jobs,
-             z_offsets=z_offsets or None, use_cache=USE_CACHE)
+    if not _cfg_path.exists():
+        raise FileNotFoundError(
+            f"{_cfg_path} not found. Configuration (rec_folder/sortout/shanks/"
+            "animal_id/z_offsets/etc.) lives in curated_analyzer_files.json next "
+            "to this script -- create it (see process_from_json's docstring for "
+            "the format) rather than editing this file."
+        )
+    process_from_json(overwrite=_ow or None)

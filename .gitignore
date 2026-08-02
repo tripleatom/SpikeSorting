@@ -1,5 +1,8 @@
 __pycache__
 build
+dist
+*.exe
+*.spec
 ._*
 *.ipynb
 .DS_Store
@@ -7,7 +10,9 @@ build
 !rec2nwb/device_types.json
 *.egg-info
 benchmark_results
+pipeline_logs
 .claude
 .vscode
 *test*
+!rec2nwb/test_gap_detection.py
 *record

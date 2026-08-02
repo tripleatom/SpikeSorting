@@ -132,6 +132,31 @@ Raw data (.rhd / .rec)
 
 ## Usage
 
+### 0. One window for the whole daily run (SpikeGadgets)
+
+The three steps run on every day's recording — DIO gap export, NWB conversion,
+MountainSort5 — are wrapped in a single GUI:
+
+```bash
+python pipeline_gui.py
+```
+
+Pick the recording folder once; animal ID, device type and shank list are filled
+in from `device_types.json` and the probe map, then shared by all three steps.
+Per-step options (trodesexport path, electrode location, `sorter_params`, ...)
+live on their own tabs, and any subset of the steps can be run. **Check setup**
+reports what will be read and written before anything starts.
+
+Steps 2 and 3 run as child processes under the interpreter named in
+*Python (steps 2, 3)* — point it at the conda env with spikeinterface +
+mountainsort5 if the window was started from a different one. Each run writes
+`pipeline_logs/<timestamp>_<session>/` with the log and the exact JSON configs
+used; widget values are remembered in `pipeline_gui_settings.json`.
+
+The steps are equivalent to running `rec2nwb/trodes_dio_gui.py`,
+`rec2nwb/rec2nwb_interp.py` and `spikesorting/MsSorting.py` by hand, which is
+still supported — see below.
+
 ### 1. Screen bad channels
 
 Run the interactive GUI to mark bad or dead channels before conversion:

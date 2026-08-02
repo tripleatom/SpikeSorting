@@ -55,6 +55,7 @@ from rec2nwb.utils.file_io import (
 )
 from rec2nwb.utils.electrode import (
     get_ch_index_on_shank, build_electrode_df, resolve_good_channel_ids,
+    get_all_shanks,
 )
 from tqdm import tqdm
 
@@ -280,8 +281,12 @@ class SpikeGadgetsRecToNWB:
                     if post_start < post_end else None)
             return last_good, self._pchip_fill(pre, post, n_missing)
 
+        # One worker per gap was fine while gap lists were empty or tiny, but a
+        # bad session has thousands of them, and each does two seeks into a
+        # multi-GB recording. Cap it so the reads stay sequential enough to be
+        # fast and the thread count stays sane.
         filled = {}
-        with ThreadPoolExecutor(max_workers=len(gaps)) as ex:
+        with ThreadPoolExecutor(max_workers=min(len(gaps), 16)) as ex:
             for last_good, arr in (f.result() for f in
                                    as_completed(ex.submit(_fill_one, lg, nm)
                                                 for lg, nm in gaps)):
@@ -609,30 +614,26 @@ def process_folder(config: dict) -> None:
     print(f"\n{'='*60}")
     print(f"Conversion order ({len(data_files)} file(s)):")
     print(f"{'='*60}")
-    log_lines = [f"Conversion order ({len(data_files)} file(s)):"]
-    part_frame_counts = []
+    part_frame_counts = []      # packets actually recorded, i.e. what SI reports
+    read_errors = {}
     for i, f in enumerate(data_files, 1):
         try:
             rec = se.read_spikegadgets(str(f))
             nf = rec.get_num_frames()
             part_frame_counts.append(nf)
-            line = f"  {i:2d}. {f.name}: {nf} timestamps"
+            print(f"  {i:2d}. {f.name}: {nf} recorded packets")
         except Exception as e:
             part_frame_counts.append(0)
-            line = f"  {i:2d}. {f.name}: ERROR — {e}"
-        print(line)
-        log_lines.append(line)
+            read_errors[i] = str(e)
+            print(f"  {i:2d}. {f.name}: ERROR — {e}")
     print(f"{'='*60}\n")
-
-    log_path = data_folder / "conversion_list.txt"
-    log_path.write_text('\n'.join(log_lines) + '\n')
-    print(f"Conversion list saved to: {log_path}\n")
 
     # --- Gap pre-computation from sidecar .txt files ---
     # Each session folder (f.parent) has its own DIO and its own first timestamp.
     # Track per-folder: first_timestamp and cumulative frame offset within that folder.
     _folder_first_ts = {}   # rec_folder -> first hardware timestamp (or None)
     _folder_cum = {}        # rec_folder -> cumulative frames seen so far in that folder
+    _folder_missing = {}    # rec_folder -> cumulative dropped samples seen so far
 
     file_gaps = []
     for f, nf in zip(data_files, part_frame_counts):
@@ -648,22 +649,58 @@ def process_folder(config: dict) -> None:
                       f"({e}). Gap interpolation disabled for this folder.")
                 _folder_first_ts[rec_folder] = None
             _folder_cum[rec_folder] = 0
+            _folder_missing[rec_folder] = 0
 
         first_timestamp = _folder_first_ts[rec_folder]
         cum_offset = _folder_cum[rec_folder]
 
         txt_path = f.parent / (f.name + '.txt')
+        gaps = []
         if first_timestamp is not None:
-            raw_gaps = converter._parse_gap_file(txt_path)
-            gaps = [
-                (t - first_timestamp - cum_offset, n)
-                for t, n in raw_gaps
-                if 0 <= t - first_timestamp - cum_offset < nf
-            ]
-        else:
-            gaps = []
+            # _iter_chunks_with_gaps indexes the RAW recording, where a dropped
+            # sample is simply absent: the index advances once per recorded
+            # packet while the timestamp advances once per elapsed sample
+            # period. Every gap therefore shifts all later samples one index
+            # earlier than their timestamp suggests, so the running total of
+            # dropped samples has to come off as well. It accumulates across
+            # the whole folder because first_timestamp is the folder's origin.
+            cum_missing = _folder_missing[rec_folder]
+            for t, n in converter._parse_gap_file(txt_path):
+                idx = t - first_timestamp - cum_offset - cum_missing
+                if 0 <= idx < nf:
+                    gaps.append((idx, n))
+                cum_missing += n
+            _folder_missing[rec_folder] = cum_missing
         file_gaps.append(gaps)
         _folder_cum[rec_folder] = cum_offset + nf
+
+    # --- Conversion list, in NWB sample numbers ---
+    # Written only now that the gaps are known: the counts below are what each
+    # file contributes to the .nwb (recorded packets plus interpolated fills),
+    # so the offsets line up with sample indices in the finished file. Reporting
+    # the raw packet counts here would understate every file that lost packets.
+    log_lines = [f"Conversion order ({len(data_files)} file(s)):",
+                 "Counts are NWB samples = recorded packets + interpolated fills.",
+                 ""]
+    start = 0
+    for i, (f, nf, gaps) in enumerate(zip(data_files, part_frame_counts, file_gaps), 1):
+        if i in read_errors:
+            log_lines.append(f"  {i:2d}. {f.name}: ERROR — {read_errors[i]}")
+            continue
+        filled = sum(n for _, n in gaps)
+        total = nf + filled
+        line = (f"  {i:2d}. {f.name}: {total} samples  "
+                f"[nwb {start}-{start + total - 1}]")
+        if filled:
+            line += f"  ({nf} recorded + {filled} filled over {len(gaps)} gap(s))"
+        log_lines.append(line)
+        start += total
+    log_lines += ["", f"Total NWB samples: {start}"]
+
+    log_path = data_folder / "conversion_list.txt"
+    log_path.write_text('\n'.join(log_lines) + '\n')
+    print('\n'.join(log_lines))
+    print(f"\nConversion list saved to: {log_path}\n")
 
     bad_ch_ids = load_bad_ch(data_folder / "bad_channels.txt")
 
@@ -739,8 +776,10 @@ def main():
     animal_id = get_animal_id(data_folder)
     device_type = get_or_set_device_type(animal_id)
 
-    raw = input("Shank numbers (e.g. 0,1,2,3 or [0,1,2,3]): ")
-    shanks = [int(x) for x in re.findall(r'\d+', raw)]
+    all_shanks = get_all_shanks(device_type)
+    raw = input(f"Shank numbers (e.g. 0,1,2,3 or [0,1,2,3]) "
+                f"[Enter = all {len(all_shanks)}: {','.join(map(str, all_shanks))}]: ")
+    shanks = [int(x) for x in re.findall(r'\d+', raw)] or all_shanks
     print(f"Processing shanks: {shanks}")
 
     config = {
