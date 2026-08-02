@@ -3,8 +3,34 @@ Channel-map loading and electrode DataFrame construction.
 """
 
 from pathlib import Path
+import sys
 import numpy as np
 import pandas as pd
+
+
+def mapping_dir() -> Path:
+    """Folder holding the per-device channel-map CSVs.
+
+    Inside a PyInstaller build ``__file__`` points into the unpacked temp dir,
+    so resolve against the .exe instead -- that keeps the maps editable on disk
+    rather than frozen into the binary.
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent / "rec2nwb" / "mapping"
+    return Path(__file__).resolve().parent.parent / "mapping"
+
+
+def _load_channel_map(device_type: str) -> pd.DataFrame:
+    return pd.read_csv(mapping_dir() / f"{device_type}.csv")
+
+
+def get_all_shanks(device_type: str) -> list:
+    """
+    Return every shank index present in the device's channel map, sorted.
+
+    Used as the default when the user does not name specific shanks.
+    """
+    return sorted(int(s) for s in _load_channel_map(device_type)['sh'].unique())
 
 
 def get_ch_index_on_shank(ishank: int, device_type: str) -> tuple:
@@ -14,8 +40,7 @@ def get_ch_index_on_shank(ishank: int, device_type: str) -> tuple:
     Returns:
         (channel_indices, x_coords, y_coords)
     """
-    mapping_file = Path(__file__).resolve().parent.parent / "mapping" / f"{device_type}.csv"
-    channel_map = pd.read_csv(mapping_file)
+    channel_map = _load_channel_map(device_type)
 
     xcoord = channel_map['xcoord'].astype(float).to_numpy()
     ycoord = channel_map['ycoord'].astype(float).to_numpy()

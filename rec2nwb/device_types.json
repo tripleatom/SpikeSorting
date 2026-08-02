@@ -26,5 +26,9 @@
     "CnL45_1": "4shank32intan",
     "CnL45_2": "4shank32intan",
     "CnL46_1": "4shank32intan",
-    "CnL46_2": "4shank32intan"
+    "CnL46_2": "4shank32intan",
+    "CnL43_1": "4shank32intan",
+    "CnL43_2": "4shank32intan",
+    "CnL45": "8shank32",
+    "CnL46": "8shank32"
 }

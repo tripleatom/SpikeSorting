@@ -126,6 +126,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--csv-path", type=Path, default=CSV_PATH)
+    parser.add_argument("--analyzer-path", type=Path, default=None,
+                        help="plot a single curated_analyzer folder directly, "
+                             "bypassing CSV session discovery (e.g. for animals "
+                             "not tracked in the CnL42SG curation plan CSV)")
     parser.add_argument("--output-base", type=Path, default=OUTPUT_BASE,
                         help="centralize PNGs here; default writes next to each analyzer")
     parser.add_argument("--include-labels", nargs="+", default=list(INCLUDE_LABELS))
@@ -137,7 +141,13 @@ def main() -> None:
     args = parse_args()
     include_labels = {label.lower() for label in args.include_labels}
 
-    sessions = discover_sessions(args.csv_path)
+    if args.analyzer_path is not None:
+        curated_path = args.analyzer_path
+        session_path = curated_path.parent
+        session_name = session_path.name
+        sessions = [(session_name, session_path, curated_path)]
+    else:
+        sessions = discover_sessions(args.csv_path)
     print(f"Discovered {len(sessions)} session(s) with a curated_analyzer.")
 
     total_plotted = total_skipped = 0
