@@ -318,6 +318,20 @@ class BadChannelScreener:
 
                 check.on_clicked(checkbox_callback)
 
+                # Add a 'Select All' button to mark every channel on this shank as bad
+                select_all_ax = fig.add_axes([0.77, 0.92, 0.11, 0.05])
+                select_all_button = Button(select_all_ax, 'Select All')
+                select_all_button.label.set_fontsize(10)
+
+                def select_all_callback(event):
+                    # set_active toggles the box and fires checkbox_callback, which updates seg_bad_flags
+                    for i, is_checked in enumerate(check.get_status()):
+                        if not is_checked:
+                            check.set_active(i)
+                    print(f"All {len(display_ids)} channels on shank {ishank} marked bad.")
+
+                select_all_button.on_clicked(select_all_callback)
+
                 # Add a 'Finish' button to exit the loop
                 finish_ax = fig.add_axes([0.89, 0.92, 0.10, 0.05])  # Adjusted position
                 finish_button = Button(finish_ax, 'Finish')
