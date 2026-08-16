@@ -309,28 +309,41 @@ class BadChannelScreener:
                 visibility = [seg_bad_flags[str(cid)] for cid in display_ids]
                 check = CheckButtons(rax, [str(cid) for cid in display_ids], visibility)
 
+                def sync_select_all_label():
+                    # the button clears the shank once everything is already marked
+                    text = 'Deselect All' if all(check.get_status()) else 'Select All'
+                    if select_all_button.label.get_text() != text:
+                        select_all_button.label.set_text(text)
+                        fig.canvas.draw_idle()
+
                 def checkbox_callback(label):
                     seg_bad_flags[label] = not seg_bad_flags[label]
                     if seg_bad_flags[label]:
                         print(f"Channel {label} marked bad.")
                     else:
                         print(f"Channel {label} unmarked.")
+                    sync_select_all_label()
 
                 check.on_clicked(checkbox_callback)
 
-                # Add a 'Select All' button to mark every channel on this shank as bad
+                # Add a 'Select All' button toggling every channel on this shank
                 select_all_ax = fig.add_axes([0.77, 0.92, 0.11, 0.05])
                 select_all_button = Button(select_all_ax, 'Select All')
                 select_all_button.label.set_fontsize(10)
 
                 def select_all_callback(event):
                     # set_active toggles the box and fires checkbox_callback, which updates seg_bad_flags
-                    for i, is_checked in enumerate(check.get_status()):
-                        if not is_checked:
+                    status = list(check.get_status())  # snapshot: set_active mutates it
+                    target = not all(status)           # all marked -> clear, otherwise fill
+                    for i, is_checked in enumerate(status):
+                        if is_checked != target:
                             check.set_active(i)
-                    print(f"All {len(display_ids)} channels on shank {ishank} marked bad.")
+                    action = "marked bad" if target else "unmarked"
+                    print(f"All {len(display_ids)} channels on shank {ishank} {action}.")
+                    sync_select_all_label()
 
                 select_all_button.on_clicked(select_all_callback)
+                sync_select_all_label()
 
                 # Add a 'Finish' button to exit the loop
                 finish_ax = fig.add_axes([0.89, 0.92, 0.10, 0.05])  # Adjusted position
