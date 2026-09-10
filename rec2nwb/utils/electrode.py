@@ -2,26 +2,10 @@
 Channel-map loading and electrode DataFrame construction.
 """
 
-from pathlib import Path
-import sys
+import json
 import numpy as np
 import pandas as pd
-
-
-def mapping_dir() -> Path:
-    """Folder holding the per-device channel-map CSVs.
-
-    Inside a PyInstaller build ``__file__`` points into the unpacked temp dir,
-    so resolve against the .exe instead -- that keeps the maps editable on disk
-    rather than frozen into the binary.
-    """
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent / "rec2nwb" / "mapping"
-    return Path(__file__).resolve().parent.parent / "mapping"
-
-
-def _load_channel_map(device_type: str) -> pd.DataFrame:
-    return pd.read_csv(mapping_dir() / f"{device_type}.csv")
+from rec2nwb.probes import load_probes, probe_for_channels
 
 
 def get_all_shanks(device_type: str) -> list:
@@ -30,7 +14,8 @@ def get_all_shanks(device_type: str) -> list:
 
     Used as the default when the user does not name specific shanks.
     """
-    return sorted(int(s) for s in _load_channel_map(device_type)['sh'].unique())
+    return sorted({int(sh) for p in load_probes(device_type)
+                   for sh in p.shank_ids[p.device_channel_indices >= 0]})
 
 
 def get_ch_index_on_shank(ishank: int, device_type: str) -> tuple:
@@ -40,19 +25,20 @@ def get_ch_index_on_shank(ishank: int, device_type: str) -> tuple:
     Returns:
         (channel_indices, x_coords, y_coords)
     """
-    channel_map = _load_channel_map(device_type)
-
-    xcoord = channel_map['xcoord'].astype(float).to_numpy()
-    ycoord = channel_map['ycoord'].astype(float).to_numpy()
-    sh = channel_map['sh'].astype(int).to_numpy()
-
-    ch_index = np.where(sh == ishank)[0]
-    return ch_index, xcoord[ch_index], ycoord[ch_index]
+    rows = []
+    for probe in load_probes(device_type):
+        selected = (probe.shank_ids.astype(int) == ishank) & (probe.device_channel_indices >= 0)
+        rows.extend(zip(probe.device_channel_indices[selected], *probe.contact_positions[selected].T))
+    rows.sort()
+    if not rows:
+        return np.array([], dtype=int), np.array([], dtype=float), np.array([], dtype=float)
+    channels, x, y = zip(*rows)
+    return np.array(channels, dtype=int), np.array(x), np.array(y)
 
 
 def build_electrode_df(channel_index: np.ndarray, xcoord: np.ndarray, ycoord: np.ndarray,
                        recording_method: str, impedance_table: pd.DataFrame = None,
-                       bad_ch_ids: list = None) -> pd.DataFrame:
+                       bad_ch_ids: list = None, device_type: str = None) -> pd.DataFrame:
     """
     Build an electrode DataFrame for one shank, optionally filtering bad channels.
 
@@ -63,9 +49,11 @@ def build_electrode_df(channel_index: np.ndarray, xcoord: np.ndarray, ycoord: np
         recording_method: 'intan', 'spikegadget', or 'spikegadget_rec'.
         impedance_table: DataFrame from an impedance CSV (optional).
         bad_ch_ids: Channel names to exclude (optional).
+        device_type: Probe map name; includes contact geometry when supplied.
 
     Returns:
-        DataFrame with columns: channel_name, impedance, x, y, channel_index.
+        DataFrame with channel_name, impedance, x, y, channel_index, plus
+        contact_id, contact_shape, contact_shape_params, shank_id when requested.
     """
     if impedance_table is not None:
         impedance_sh = impedance_table['Impedance Magnitude at 1000 Hz (ohms)'].to_numpy()[channel_index]
@@ -85,6 +73,13 @@ def build_electrode_df(channel_index: np.ndarray, xcoord: np.ndarray, ycoord: np
         'y': ycoord,
         'channel_index': channel_index,
     })
+
+    if device_type is not None and len(channel_index):
+        probe = probe_for_channels(device_type, channel_index)
+        electrode_df['contact_id'] = probe.contact_ids
+        electrode_df['contact_shape'] = probe.contact_shapes
+        electrode_df['contact_shape_params'] = [json.dumps(p) for p in probe.contact_shape_params]
+        electrode_df['shank_id'] = probe.shank_ids
 
     if bad_ch_ids:
         electrode_df = electrode_df[~electrode_df['channel_name'].isin(bad_ch_ids)]

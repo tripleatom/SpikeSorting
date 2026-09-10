@@ -139,7 +139,7 @@ class EphysToNWBConverter:
         impedance_table = pd.read_csv(impedance_path) if impedance_path else None
         electrode_df = build_electrode_df(
             channel_index, xcoord, ycoord,
-            self.recording_method, impedance_table, bad_ch_ids,
+            self.recording_method, impedance_table, bad_ch_ids, device_type=device_type,
         )
         print(f"Good electrodes on shank {ishank}: {len(electrode_df)}")
 
@@ -272,7 +272,7 @@ class EphysToNWBConverter:
             channel_index, xcoord, ycoord = get_ch_index_on_shank(ish, device_type)
             electrode_df = build_electrode_df(
                 channel_index, xcoord, ycoord,
-                self.recording_method, impedance_table, bad_ch_ids,
+                self.recording_method, impedance_table, bad_ch_ids, device_type=device_type,
             )
             good_ids = resolve_good_channel_ids(
                 electrode_df, self.recording_method,

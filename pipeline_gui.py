@@ -120,8 +120,8 @@ def missing_modules(python_exe: str, modules: list[str]) -> list[str] | None:
 
 
 def list_device_types() -> list[str]:
-    return sorted(p.stem for p in MAPPING_DIR.glob("*.csv")
-                  if not p.name.startswith("._"))
+    from rec2nwb.probes import list_device_types as discover_devices
+    return discover_devices(MAPPING_DIR)
 
 
 def load_device_map() -> dict:
@@ -839,9 +839,9 @@ class App(tk.Tk):
         do_nwb, do_sort = self.do_nwb_var.get(), self.do_sort_var.get()
         if (do_nwb or (do_sort and self.direct_sort_var.get())) and not device_type:
             raise ValueError("Device type is required for steps 2 and direct_sort.")
-        if device_type and not (MAPPING_DIR / f"{device_type}.csv").exists():
+        if device_type and device_type not in list_device_types():
             raise ValueError(f"No channel map for device type {device_type!r}:\n"
-                             f"{MAPPING_DIR / (device_type + '.csv')}")
+                             f"{MAPPING_DIR} (CSV or ProbeInterface JSON)")
 
         shanks = parse_shanks(self.shanks_var.get())
         if (do_nwb or do_sort) and not shanks:

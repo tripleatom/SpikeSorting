@@ -39,19 +39,13 @@ def get_animal_id(data_folder):
 def choose_device_type(animal_id: str) -> str:
     """
     Pop up a small Tk window to let the user pick one of the
-    CSV‐stems inside ./mapping (ignores any files starting with ._).
+    probe map names inside ./mapping (ignores any files starting with ._).
     Returns the chosen stem (string).
     """
-    mapping_dir = Path(__file__).resolve().parent / "mapping"
-    if not mapping_dir.is_dir():
-        raise FileNotFoundError(f"Mapping folder not found: {mapping_dir}")
-
-    choices = sorted(
-        p.stem for p in mapping_dir.glob("*.csv")
-        if not p.name.startswith("._")
-    )
+    from rec2nwb.probes import list_device_types
+    choices = list_device_types()
     if not choices:
-        raise FileNotFoundError(f"No valid .csv files in {mapping_dir}")
+        raise FileNotFoundError("No probe maps found")
 
     root = tk.Tk()
     root.title(f"Choose device type for {animal_id}")

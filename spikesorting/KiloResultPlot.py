@@ -1,4 +1,5 @@
 #%%
+from rec2nwb.nwb_recording import read_nwb_recording
 from spikeinterface.extractors import PhySortingExtractor
 from pathlib import Path
 from spikeinterface import create_sorting_analyzer
@@ -15,7 +16,7 @@ for shank in shank:
     sorting = PhySortingExtractor(phy_folder)
 
     file_name = rf"c:\Users\xz106\data\CnL42SG_20251115_133046sh{shank}.nwb"
-    rec = se.read_nwb(file_name)
+    rec = read_nwb_recording(file_name)
 
     rec_car = sp.common_reference(rec, reference="global", operator="median")
     rec_filt = sp.bandpass_filter(rec_car, freq_min=300, freq_max=6000, dtype=np.float32)

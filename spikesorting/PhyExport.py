@@ -1,3 +1,4 @@
+from rec2nwb.nwb_recording import read_nwb_recording
 import os
 import shutil
 from pathlib import Path
@@ -39,7 +40,7 @@ def main(rec_folder, shanks, sortout_folder, animal_id="", overwrite=False, n_jo
             print(f"  No sorting results folder found in {shank_folder}")
             continue
 
-        recording = se.read_nwb_recording(str(recording_file))
+        recording = read_nwb_recording(str(recording_file))
         rec_filt = sp.bandpass_filter(recording, freq_min=300, freq_max=6000, dtype=np.float32)
 
         for sorting_results_folder in sorting_results_folders:
@@ -124,7 +125,7 @@ def main_combined(rec_folder, shanks, sortout_folder, animal_id="", overwrite=Fa
             print(f"  No sorting_analyzer for shank {ish}, skipping")
             continue
 
-        recording = se.read_nwb_recording(str(recording_file))
+        recording = read_nwb_recording(str(recording_file))
         rec_filt = sp.bandpass_filter(recording, freq_min=300, freq_max=6000, dtype=np.float32)
         # Rename channels to avoid ID collisions across shanks
         new_ids = [f"sh{ish}_{ch}" for ch in rec_filt.get_channel_ids()]

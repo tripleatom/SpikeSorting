@@ -50,7 +50,8 @@ def nwb_to_dat(nwb_file: str | Path,
     out_dir = Path(out_dir) if out_dir is not None else nwb_file.parent
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    rec = se.read_nwb_recording(str(nwb_file))
+    from rec2nwb.nwb_recording import read_nwb_recording
+    rec = read_nwb_recording(str(nwb_file))
     src_dtype = np.dtype(rec.get_dtype())
     if src_dtype.kind == "u" and dtype == "int16":
         # Re-center unsigned data so the resulting int16 .dat has offset_to_uV = 0.

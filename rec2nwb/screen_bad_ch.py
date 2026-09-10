@@ -12,28 +12,15 @@ from rec2nwb.preproc_func import get_or_set_device_type, get_animal_id
 from spikesorting.ss_proc_func import get_sortout_folder
 
 
+from rec2nwb.utils.electrode import get_all_shanks, get_ch_index_on_shank
+
+
+from rec2nwb.utils.electrode import get_all_shanks, get_ch_index_on_shank
+
+
 def get_n_shank(device_type: str) -> int:
-    script_dir = Path(__file__).resolve().parent
-    mapping_file = script_dir / "mapping" / f"{device_type}.csv"
-    sh = pd.read_csv(mapping_file)['sh'].astype(int)
-    return int(sh.nunique())
+    return len(get_all_shanks(device_type))
 
-
-def get_ch_index_on_shank(ish: int, device_type: str) -> tuple:
-    """
-    Return the channel indices on a given shank.
-    Returns: (channel indices, x-coordinates, y-coordinates)
-    """
-    script_dir = Path(__file__).resolve().parent
-    mapping_file = script_dir / "mapping" / f"{device_type}.csv"
-
-    channel_map = pd.read_csv(mapping_file)
-    xcoord = channel_map['xcoord'].astype(float).to_numpy()
-    ycoord = channel_map['ycoord'].astype(float).to_numpy()
-    sh = channel_map['sh'].astype(int).to_numpy()
-
-    ch_index = np.where(sh == ish)[0]
-    return ch_index, xcoord[ch_index], ycoord[ch_index]
 
 def format_impedance(imp):
     """

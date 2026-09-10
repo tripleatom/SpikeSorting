@@ -17,6 +17,8 @@ import pandas as pd
 import spikeinterface as si
 import spikeinterface.extractors as se
 from probeinterface import Probe
+from rec2nwb.probes import probe_for_channels
+from rec2nwb.session_id import parse_session_info
 from spikeinterface.core import BaseRecording, BaseRecordingSegment
 
 from rec2nwb.rec2nwb_interp import SpikeGadgetsRecToNWB
@@ -35,6 +37,39 @@ from rec2nwb.utils.file_io import (
 # ---------------------------------------------------------------------------
 # Lazy PCHIP gap-fill wrapper
 # ---------------------------------------------------------------------------
+
+# Actual acquisition rates in Hz when a SpikeGadgets header is incorrect.
+ANIMAL_SAMPLING_FREQUENCIES = {"GC-v2-2": 31250.0}
+
+
+class _SamplingFrequencySegment(BaseRecordingSegment):
+    def __init__(self, parent_segment, sampling_frequency):
+        super().__init__(sampling_frequency=sampling_frequency)
+        self._parent_segment = parent_segment
+
+    def get_num_samples(self):
+        return self._parent_segment.get_num_samples()
+
+    def get_traces(self, start_frame, end_frame, channel_indices):
+        return self._parent_segment.get_traces(start_frame, end_frame, channel_indices)
+
+
+class SamplingFrequencyRecording(BaseRecording):
+    """Correct the raw clock without resampling; preserve the rate in workers."""
+
+    def __init__(self, parent, sampling_frequency):
+        sampling_frequency = float(sampling_frequency)
+        if not np.isfinite(sampling_frequency) or sampling_frequency <= 0:
+            raise ValueError("sampling_frequency must be finite and positive")
+        super().__init__(sampling_frequency=sampling_frequency,
+                         channel_ids=parent.get_channel_ids(), dtype=parent.get_dtype())
+        parent.copy_metadata(self)
+        for segment in parent._recording_segments:
+            if segment.time_vector is not None or segment.t_start not in (None, 0):
+                raise ValueError("Sampling rate correction requires implicit zero-based times")
+            self.add_recording_segment(_SamplingFrequencySegment(segment, sampling_frequency))
+        self._kwargs = dict(parent=parent, sampling_frequency=sampling_frequency)
+
 
 class _LazyGapInterpolatedSegment(BaseRecordingSegment):
     """Segment that injects pre-computed PCHIP fills at gap positions."""
@@ -188,24 +223,14 @@ class LazyGapInterpolatedRecording(BaseRecording):
 # Probe construction
 # ---------------------------------------------------------------------------
 
-def _make_probe(electrode_df: pd.DataFrame, channel_id_strings: list[str]) -> Probe:
+def _make_probe(electrode_df: pd.DataFrame, channel_id_strings: list[str], device_type: str) -> Probe:
     """Build a probeinterface Probe matching the sliced recording.
 
     ``electrode_df`` has columns: channel_name, x, y, channel_index. Rows are
     already in the order we sliced the recording, so positions[i] corresponds
     to channel_id_strings[i].
     """
-    positions = np.column_stack([
-        electrode_df['x'].to_numpy(dtype=float),
-        electrode_df['y'].to_numpy(dtype=float),
-    ])
-    probe = Probe(ndim=2, si_units='um')
-    probe.set_contacts(
-        positions=positions,
-        shapes='circle',
-        shape_params={'radius': 6.0},
-    )
-    probe.set_contact_ids(channel_id_strings)
+    probe = probe_for_channels(device_type, electrode_df["channel_index"].to_numpy())
     # device_channel_indices: which channel of the (already sliced) recording
     # each contact corresponds to. Since the recording was sliced to exactly
     # these channels in this order, it is just 0..N-1.
@@ -289,7 +314,7 @@ def build_sortable_recording(
     shank : int
         Shank index (e.g. 0–7 for an 8-shank probe).
     device_type : str
-        Mapping CSV stem under ``rec2nwb/mapping/`` (e.g. ``"8shank32"``).
+        Probe map name under ``rec2nwb/mapping/`` (e.g. ``"8shank32"``).
     impedance_path : Path, optional
         Optional impedance CSV used to attach impedance values / verify channel
         names. Same semantics as the NWB pipeline.
@@ -304,6 +329,8 @@ def build_sortable_recording(
         Ready to feed into ``MsSorting._sort_shank``.
     """
     data_folder = Path(data_folder)
+    animal_id, _, _ = parse_session_info(str(data_folder))
+    sampling_frequency = ANIMAL_SAMPLING_FREQUENCIES.get(animal_id)
     converter = SpikeGadgetsRecToNWB()  # only for its gap/timestamp helpers
 
     # --- Discover parts ---
@@ -339,6 +366,10 @@ def build_sortable_recording(
             _folder_cum[rec_folder] = 0
 
         parent = _open_part(f)
+        if sampling_frequency is not None:
+            print(f"  Sampling rate override for {animal_id}: "
+                  f"{parent.get_sampling_frequency():g} -> {sampling_frequency:g} Hz")
+            parent = SamplingFrequencyRecording(parent, sampling_frequency)
         wrapped, advance = _wrap_with_gaps(
             parent, f, converter,
             first_timestamp=_folder_first_ts[rec_folder],
@@ -366,7 +397,7 @@ def build_sortable_recording(
     # Reorder electrode_df rows to follow good_indices so positions[i] matches
     # the sliced recording's channel order.
     ed_indexed = electrode_df.set_index('channel_index').loc[list(good_indices)].reset_index()
-    probe = _make_probe(ed_indexed, good_str_ids)
+    probe = _make_probe(ed_indexed, good_str_ids, device_type)
     sliced = sliced.set_probe(probe, in_place=False)
 
     if verbose:
@@ -406,13 +437,12 @@ def build_sortable_recording_intan(
     shank : int
         Shank index.
     device_type : str
-        Mapping CSV stem under ``rec2nwb/mapping/`` (e.g. ``"4shank16intan"``).
+        Probe map name under ``rec2nwb/mapping/`` (e.g. ``"4shank16intan"``).
     impedance_path : Path, optional
         Optional impedance CSV whose ``Channel Name`` column supplies channel IDs
         (e.g. ``"A-000"``) to select, mirroring the NWB pipeline. **Not required:**
-        when omitted, channels are selected by native position — the mapping CSV's
-        row order is the Intan native channel order, so ``channel_index`` indexes the
-        recording directly.
+        when omitted, channels are selected by the probe's device channel indices,
+        which index the recording's native channel order directly.
     bad_ch_ids : list, optional
         Channel names to exclude (matches what ``load_bad_ch`` returns). With an
         impedance CSV these are the impedance ``Channel Name`` values (e.g.
@@ -474,9 +504,8 @@ def build_sortable_recording_intan(
         ed_ordered = (electrode_df.set_index('channel_name')
                       .loc[good_str_ids].reset_index())
     else:
-        # No impedance file: select by NATIVE POSITION. The mapping CSV's row order
-        # is the Intan native channel order, so channel_index indexes the recording
-        # directly — no channel-name matching (and thus no impedance CSV) needed.
+        # No impedance file: device channel indices select native recording
+        # positions directly, without channel-name matching.
         positions = electrode_df['channel_index'].to_numpy()
         n_rec = len(actual_ids)
         oob = positions[(positions < 0) | (positions >= n_rec)]
@@ -498,7 +527,7 @@ def build_sortable_recording_intan(
 
     # --- Attach probe geometry ---
     # select_channels preserves the given order, so positions[i] <-> good_ids[i].
-    probe = _make_probe(ed_ordered, good_str_ids)
+    probe = _make_probe(ed_ordered, good_str_ids, device_type)
     sliced = sliced.set_probe(probe, in_place=False)
 
     if verbose:

@@ -49,7 +49,8 @@ def evaluate_noise(nwb_file: str | Path,
                    psd_nperseg: int = 4096,
                    save: bool = True):
     nwb_file = Path(nwb_file)
-    rec = se.read_nwb_recording(str(nwb_file))
+    from rec2nwb.nwb_recording import read_nwb_recording
+    rec = read_nwb_recording(str(nwb_file))
     fs = rec.sampling_frequency
     n_ch = rec.get_num_channels()
     ch_ids = rec.get_channel_ids()

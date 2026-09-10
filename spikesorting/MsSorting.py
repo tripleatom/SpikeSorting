@@ -1,3 +1,4 @@
+from rec2nwb.nwb_recording import read_nwb_recording
 import os
 import sys
 import time
@@ -536,7 +537,7 @@ def main(rec_folder=None, sorter_params=None, shanks=None, animal_id="", sortout
             if not nwb_folder.exists():
                 print(f"NWB file not found: {nwb_folder}")
                 continue
-            rec = se.read_nwb_recording(str(nwb_folder))
+            rec = read_nwb_recording(str(nwb_folder))
 
         # Create the timestamped results folder up front so the whole run
         # (sorting + metrics) can be logged into it.

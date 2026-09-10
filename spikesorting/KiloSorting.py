@@ -1,4 +1,5 @@
 #%%
+from rec2nwb.nwb_recording import read_nwb_recording
 import re
 import time
 import json
@@ -78,7 +79,7 @@ print(f"Output folder: {sort_out_folder}")
 # Load recording
 # ============================================================
 print(f"\nLoading NWB: {nwb_path}")
-rec = se.read_nwb_recording(str(nwb_path))
+rec = read_nwb_recording(str(nwb_path))
 fs = rec.get_sampling_frequency()
 print(f"  {rec.get_num_channels()} channels, {fs} Hz, {rec.get_total_duration():.1f} s")
 

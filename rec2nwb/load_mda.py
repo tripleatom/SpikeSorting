@@ -13,16 +13,18 @@ spikegadgets_file = Path(rf"\\10.129.151.108\xieluanlabs\xl_cl\experiment_data\C
 
 recording = si.read_spikegadgets(spikegadgets_file)
 
-# Set channel locations from device mapping CSV
-# spikegadget column == .rec channel ID (bare numeric string)
+# Attach the full ProbeInterface group in recording channel order.
+from rec2nwb.probes import load_probes
+from probeinterface import ProbeGroup
 device_type = "8shank32"
-mapping_file = Path(__file__).resolve().parent / "mapping" / f"{device_type}.csv"
-channel_map = pd.read_csv(mapping_file)
-ch_to_pos = {str(int(row['spikegadget'])): (row['xcoord'], row['ycoord'])
-             for _, row in channel_map.iterrows()}
-ch_ids = recording.get_channel_ids()
-locations = np.array([ch_to_pos[ch] for ch in ch_ids])  # shape (N, 2): col0=x, col1=depth
-recording.set_channel_locations(locations)
+channel_positions = {str(ch): i for i, ch in enumerate(recording.get_channel_ids())}
+group = ProbeGroup()
+for probe in load_probes(device_type):
+    probe.set_device_channel_indices([
+        channel_positions.get(str(ch), -1) for ch in probe.device_channel_indices
+    ])
+    group.add_probe(probe)
+recording = recording.set_probegroup(group, in_place=False)
 
 print(recording)
 

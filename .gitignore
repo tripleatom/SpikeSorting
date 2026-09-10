@@ -8,6 +8,7 @@ dist
 .DS_Store
 *.json
 !rec2nwb/device_types.json
+!rec2nwb/mapping/*.probeinterface.json
 *.egg-info
 benchmark_results
 pipeline_logs
@@ -15,4 +16,5 @@ pipeline_logs
 .vscode
 *test*
 !rec2nwb/test_gap_detection.py
+!rec2nwb/test_probe_mapping.py
 *record

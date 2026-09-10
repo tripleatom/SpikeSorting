@@ -16,7 +16,8 @@ for shank in shanks:
 
     file_name = rf"c:\Users\xz106\data\CnL42SG_20251115_133046sh{shank}.nwb"
 
-    rec = se.read_nwb(file_name)
+    from rec2nwb.nwb_recording import read_nwb_recording
+    rec = read_nwb_recording(file_name)
     rec
     rec_folder = Path(file_name).parent
 

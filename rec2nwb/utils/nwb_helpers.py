@@ -44,6 +44,16 @@ def add_electrodes_to_nwb(nwbfile: NWBFile, electrode_df: pd.DataFrame,
     """
     device = nwbfile.create_device(name="--", description="--", manufacturer="--")
     nwbfile.add_electrode_column(name="label", description="label of electrode")
+    probe_columns = {
+        "contact_id": "Stable ProbeInterface contact ID",
+        "contact_shape": "ProbeInterface contact shape",
+        "contact_shape_params": "JSON shape parameters in micrometres",
+        "shank_id": "Original probe shank ID",
+        "channel_index": "Zero-based acquisition channel position",
+    }
+    for name, description in probe_columns.items():
+        if name in electrode_df:
+            nwbfile.add_electrode_column(name=name, description=description)
 
     electrode_group = nwbfile.create_electrode_group(
         name=f"shank{ishank}",
@@ -55,6 +65,7 @@ def add_electrodes_to_nwb(nwbfile: NWBFile, electrode_df: pd.DataFrame,
     for _, row in electrode_df.iterrows():
         imp = float(row['impedance']) if not np.isnan(row['impedance']) else 0.0
         nwbfile.add_electrode(
+            **{name: row[name] for name in probe_columns if name in electrode_df},
             group=electrode_group,
             label=f"shank{ishank}:{row['channel_name']}",
             location=electrode_location,
