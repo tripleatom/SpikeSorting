@@ -87,6 +87,25 @@ def build_electrode_df(channel_index: np.ndarray, xcoord: np.ndarray, ycoord: np
     return electrode_df.reset_index(drop=True)
 
 
+def good_electrode_counts(device_type: str, bad_ch_ids: list = None,
+                          impedance_table: pd.DataFrame = None,
+                          recording_method: str = 'spikegadget_rec') -> dict:
+    """
+    Return ``{shank: number of good electrodes}`` for every shank of the device.
+
+    Uses exactly the channel selection the NWB conversion applies when it writes
+    each shank, so a shank reported here with 0 good electrodes is one the
+    conversion has nothing to write for -- a dead shank, not a missing export.
+    """
+    counts = {}
+    for ishank in get_all_shanks(device_type):
+        channel_index, xcoord, ycoord = get_ch_index_on_shank(ishank, device_type)
+        electrode_df = build_electrode_df(channel_index, xcoord, ycoord, recording_method,
+                                          impedance_table, bad_ch_ids, device_type=device_type)
+        counts[ishank] = len(electrode_df)
+    return counts
+
+
 def resolve_good_channel_ids(electrode_df: pd.DataFrame, recording_method: str,
                               has_impedance: bool, actual_channel_ids=None) -> list:
     """

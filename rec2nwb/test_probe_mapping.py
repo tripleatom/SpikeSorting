@@ -19,26 +19,35 @@ from rec2nwb.nwb_recording import read_nwb_recording
 
 
 class ProbeMappingTests(unittest.TestCase):
-    def test_converted_maps_match_csv(self):
-        for name, width in [('4shank16intan', 15), ('4shank32', 20),
-                            ('4shank32intan', 20), ('4shank32rp', 20), ('8shank32', 20)]:
+    def test_converted_probeinterface_maps(self):
+        cases = [('4shank16intan', 15, 128, 4),
+                 ('4shank32', 20, 128, 4),
+                 ('4shank32intan', 20, 128, 4),
+                 ('4shank32rp', 20, 128, 4),
+                 ('8shank32', 20, 256, 8)]
+        for name, width, contact_count, shank_count in cases:
             with self.subTest(name=name):
-                table = pd.read_csv(mapping_dir() / f'{name}.csv')
-                if name == '8shank32':
-                    table.loc[table.sh >= 4, 'xcoord'] += 1000
-                    self.assertEqual(len(load_probes(name)), 1)
-                self.assertEqual(get_all_shanks(name), sorted(table.sh.unique()))
+                probes = load_probes(name)
+                self.assertEqual(len(probes), 1)
+                source = probes[0]
+                self.assertEqual(source.get_contact_count(), contact_count)
+                self.assertEqual(get_all_shanks(name), list(range(shank_count)))
+                position_by_channel = {
+                    int(channel): position
+                    for channel, position in zip(source.device_channel_indices,
+                                                 source.contact_positions)
+                    if channel >= 0
+                }
                 for shank in get_all_shanks(name):
                     ch, x, y = get_ch_index_on_shank(shank, name)
-                    rows = table[table.sh == shank]
-                    np.testing.assert_array_equal(ch, rows.index)
-                    np.testing.assert_array_equal(x, rows.xcoord)
-                    np.testing.assert_array_equal(y, rows.ycoord)
+                    expected_positions = np.asarray([position_by_channel[int(i)] for i in ch])
+                    np.testing.assert_array_equal(x, expected_positions[:, 0])
+                    np.testing.assert_array_equal(y, expected_positions[:, 1])
                     # Mimic dropped bad channels and a reordered recording.
                     selected = ch[::2][::-1]
                     probe = probe_for_channels(name, selected)
                     np.testing.assert_array_equal(probe.contact_positions,
-                                                  table.loc[selected, ['xcoord', 'ycoord']])
+                                                  [position_by_channel[int(i)] for i in selected])
                     self.assertTrue(all(s == 'square' for s in probe.contact_shapes))
                     self.assertTrue(all(p['width'] == width for p in probe.contact_shape_params))
                     recording = NumpyRecording(np.zeros((10, len(selected))), 30000)

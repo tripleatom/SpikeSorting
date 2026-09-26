@@ -67,6 +67,29 @@ from rec2nwb.utils.nwb_helpers import (
 HOUSTON_TZ = ZoneInfo("America/Chicago")
 
 
+def incomplete_nwb_path(nwb_path: Path) -> Path:
+    """Return the visible staging name used until an NWB conversion finishes."""
+    return Path(f"{Path(nwb_path)}.incomplete")
+
+
+def _prepare_incomplete_nwb(nwb_path: Path) -> Path:
+    """Remove an abandoned staging file and return a fresh staging path."""
+    staging_path = incomplete_nwb_path(nwb_path)
+    if staging_path.exists():
+        print(f"Removing incomplete conversion from an earlier run: {staging_path.name}")
+        staging_path.unlink()
+    # Create the marker immediately. This also covers an overwrite run that
+    # fails while reading metadata, before NWBHDF5IO has created its output.
+    staging_path.touch()
+    return staging_path
+
+
+def _publish_completed_nwb(staging_path: Path, nwb_path: Path) -> None:
+    """Atomically replace the public NWB only after conversion has succeeded."""
+    staging_path.replace(nwb_path)
+    print(f"Completed NWB: {nwb_path.name}")
+
+
 def _prefetch_chunks(gen, prefetch: int = 1):
     """Wrap a chunk generator to read `prefetch` chunks ahead in a background thread.
 
@@ -480,10 +503,12 @@ class SpikeGadgetsRecToNWB:
                 has_impedance=(impedance_table is not None),
             )
             print(f"Shank {ish}: {len(electrode_df)} good electrodes")
+            nwb_path = data_folder / f"{session_description}sh{ish}.nwb"
             shank_setups[ish] = {
                 'electrode_df': electrode_df,
                 'good_channel_ids': good_ids,
-                'nwb_path': data_folder / f"{session_description}sh{ish}.nwb",
+                'final_nwb_path': nwb_path,
+                'nwb_path': _prepare_incomplete_nwb(nwb_path),
             }
 
         # --- Combined channel list (union, order-preserving) ---
@@ -572,6 +597,13 @@ class SpikeGadgetsRecToNWB:
                     for ish in shanks:
                         append_fns[ish](chunk[:, shank_setups[ish]['col_indices']])
             print(f"File {file_idx}/{len(data_files)} done in {time.time()-t0:.1f}s")
+
+        # A public .nwb name means the entire conversion finished. Until this
+        # point each file keeps the visible .nwb.incomplete suffix, so a killed
+        # process cannot leave a partial file that looks finished.
+        for ish in shanks:
+            setup = shank_setups[ish]
+            _publish_completed_nwb(setup['nwb_path'], setup['final_nwb_path'])
 
         return {ish: shank_setups[ish]['good_channel_ids'] for ish in shanks}
 
@@ -725,11 +757,12 @@ def process_folder(config: dict) -> None:
         print("\nMode: parallelShank=False — processing shanks sequentially")
         for ish in shanks:
             nwb_path = data_folder / f"{session_description}sh{ish}.nwb"
-            print(f"\n{'='*60}\nCreating {nwb_path.name}\n{'='*60}")
+            staging_path = _prepare_incomplete_nwb(nwb_path)
+            print(f"\n{'='*60}\nCreating {staging_path.name}\n{'='*60}")
 
             t_file = time.time()
             good_ch = converter.initiate_nwb(
-                first_file, nwb_path, ishank=ish,
+                first_file, staging_path, ishank=ish,
                 impedance_path=impedance_file, bad_ch_ids=bad_ch_ids,
                 metadata=shared_metadata, has_multiple_files=(len(data_files) > 1),
                 gaps=file_gaps[0],
@@ -738,14 +771,15 @@ def process_folder(config: dict) -> None:
 
             if len(data_files) == 1:
                 print("Single file — no appending needed.")
-                continue
+            else:
+                for idx, f in enumerate(data_files[1:], 2):
+                    print(f"\n{'-'*60}\nAppending file {idx}/{len(data_files)}: {f.name}\n{'-'*60}")
+                    t_file = time.time()
+                    converter.append_nwb(staging_path, f, channel_ids=good_ch,
+                                         gaps=file_gaps[idx - 1])
+                    print(f"File {idx}/{len(data_files)} ({f.name}) done in {time.time()-t_file:.1f}s.")
 
-            for idx, f in enumerate(data_files[1:], 2):
-                print(f"\n{'-'*60}\nAppending file {idx}/{len(data_files)}: {f.name}\n{'-'*60}")
-                t_file = time.time()
-                converter.append_nwb(nwb_path, f, channel_ids=good_ch,
-                                     gaps=file_gaps[idx - 1])
-                print(f"File {idx}/{len(data_files)} ({f.name}) done in {time.time()-t_file:.1f}s.")
+            _publish_completed_nwb(staging_path, nwb_path)
 
     print(f"\nTotal time: {time.time()-t0:.1f}s")
     print("\n" + "="*60)

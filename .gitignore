@@ -17,4 +17,5 @@ pipeline_logs
 *test*
 !rec2nwb/test_gap_detection.py
 !rec2nwb/test_probe_mapping.py
+!rec2nwb/test_incomplete_guard.py
 *record

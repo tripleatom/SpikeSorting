@@ -1,8 +1,8 @@
 """
 build_exe.py
 ============
-Package pipeline_gui.py as ``pipeline_gui.exe`` so the daily run can be started
-by double-clicking instead of activating a conda env first.
+Package pipeline_launcher.py as ``pipeline_gui.exe`` so the daily run can be
+started by double-clicking instead of activating a conda env first.
 
 What the .exe is (and is not)
 -----------------------------
@@ -16,9 +16,9 @@ run in a *separate* interpreter (pipeline_runner.py under the env named in
   * a conda environment with spikeinterface / pynwb / mountainsort5 for the
     child process. "Check setup" verifies that env before anything runs.
 
-Only the window itself is frozen: tkinter, plus pandas for reading a channel
-map. spikeinterface, pynwb, h5py and mountainsort5 are deliberately absent,
-which is what keeps the build small and reliable.
+The executable is a small native-looking launcher. It starts pipeline_gui.py
+under the configured Conda interpreter, so Tkinter and the scientific stack
+come from one consistent environment instead of being partially frozen.
 
 The build runs in a throwaway venv rather than in the sorting environment, so
 PyInstaller cannot sweep the whole scientific stack into the binary and nothing
@@ -40,11 +40,11 @@ REPO_ROOT = Path(__file__).resolve().parent
 BUILD_DIR = REPO_ROOT / "build"
 VENV_DIR = BUILD_DIR / "exe_venv"
 WORK_DIR = BUILD_DIR / "pyinstaller"
-ENTRY = REPO_ROOT / "pipeline_gui.py"
+ENTRY = REPO_ROOT / "pipeline_launcher.py"
 EXE_NAME = "pipeline_gui"
 
 # Only what the window itself needs. Everything heavy stays in the conda env.
-BUILD_REQUIREMENTS = ["pyinstaller", "pandas"]
+BUILD_REQUIREMENTS = ["pyinstaller"]
 
 # Belt and braces: these are not installed in the build venv, but naming them
 # means a future stray import fails the build loudly instead of adding 500 MB.

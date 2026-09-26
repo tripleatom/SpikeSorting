@@ -9,6 +9,7 @@ import shutil
 import re
 import random
 from rec2nwb.preproc_func import get_or_set_device_type, get_animal_id
+from rec2nwb.utils.file_io import load_bad_ch, merge_bad_ch
 from spikesorting.ss_proc_func import get_sortout_folder
 
 
@@ -161,11 +162,12 @@ class BadChannelScreener:
             n_segments: Number of random segments to generate for screening (default: 10)
         """
         bad_file = data_folder / "bad_channels.txt"
+        existing_bad_ch_ids = load_bad_ch(bad_file)
         if bad_file.exists():
             answer = input(f"{bad_file} already exists. Redo screening? (y/n): ")
             if answer.lower() not in ['y', 'yes']:
                 print("Screening aborted. Using existing bad channel file.")
-                return [line.strip() for line in open(bad_file)]
+                return existing_bad_ch_ids
 
         # Derive animal_id and session_id from folder structure
         session_id = self.get_session_description(data_folder)
@@ -195,7 +197,9 @@ class BadChannelScreener:
         # Apply common reference with shank-based groups
         rec_cr = sp.common_reference(rec_filter, reference='global', operator='median', groups=all_groups)
 
-        all_bad_ch_ids = []
+        # A targeted redo replaces labels only for that shank. Start with the
+        # existing file so labels on every unreviewed shank are retained.
+        all_bad_ch_ids = existing_bad_ch_ids if target_shank is not None else []
 
         shanks_to_screen = [target_shank] if target_shank is not None else list(range(n_shank))
         for ishank in shanks_to_screen:
@@ -242,7 +246,14 @@ class BadChannelScreener:
 
             print(f"Will screen {len(segment_starts)} RANDOM segments of {segment_duration}s each")
 
-            shank_bad = set()
+            screened_channel_ids = {str(cid) for cid in display_ids}
+            shank_bad = (
+                set(existing_bad_ch_ids) & screened_channel_ids
+                if target_shank is not None else set()
+            )
+            if shank_bad:
+                print(f"Starting with existing bad channels on shank {ishank}: "
+                      f"{sorted(shank_bad)}")
             
             # Flag to check if the loop should be exited
             exit_loop = False
@@ -365,12 +376,14 @@ class BadChannelScreener:
                 # Increment segment index for next iteration
                 seg_idx += 1
 
-            # Save bad channels for the current shank
-            all_bad_ch_ids.extend(sorted(shank_bad))
+            # Replace labels for this shank and preserve labels for all other
+            # shanks. This also avoids duplicate lines in bad_channels.txt.
+            all_bad_ch_ids = merge_bad_ch(
+                all_bad_ch_ids, screened_channel_ids, shank_bad)
             print(f"Shank {ishank} bad channels: {sorted(shank_bad)}")
 
         # Write out bad channels
-        with open(bad_file, "w") as f:
+        with open(bad_file, "w", encoding="utf-8") as f:
             for cid in all_bad_ch_ids:
                 f.write(str(cid) + "\n")
 

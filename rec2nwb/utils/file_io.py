@@ -98,6 +98,33 @@ def load_bad_ch(bad_file: Path) -> list:
         return [line.strip() for line in f if line.strip()]
 
 
+def merge_bad_ch(existing, screened_channel_ids, replacement) -> list[str]:
+    """Replace bad-channel labels only for the channels just screened.
+
+    Labels for channels outside ``screened_channel_ids`` retain their original
+    order. The replacement labels are normalized to strings, deduplicated, and
+    appended in sorted order.
+    """
+    screened = {str(channel_id) for channel_id in screened_channel_ids}
+    replacement_set = {
+        str(channel_id) for channel_id in replacement
+        if str(channel_id) in screened
+    }
+
+    merged = []
+    seen = set()
+    for channel_id in existing:
+        channel_id = str(channel_id).strip()
+        if channel_id and channel_id not in screened and channel_id not in seen:
+            merged.append(channel_id)
+            seen.add(channel_id)
+    for channel_id in sorted(replacement_set):
+        if channel_id and channel_id not in seen:
+            merged.append(channel_id)
+            seen.add(channel_id)
+    return merged
+
+
 def get_geom_files(geom_folder: Path) -> list:
     """Return sorted list of .csv geometry files in geom_folder."""
     if not geom_folder.exists():

@@ -30,8 +30,9 @@ Its JSON contains one eight-shank probe, with the requested +1,000 µm x offset
 applied to shanks 4–7. Shank x positions are 0, 300, 600, 900, 1,000, 1,300,
 1,600, and 1,900 µm. Y coordinates and wiring are unchanged.
 
-The original CSVs remain for reference and compatibility. Edit the JSON for a
-converted device: edits to its CSV no longer affect the pipeline. Other devices,
+The converted devices use their ProbeInterface JSON files as the sole mapping
+source; their superseded CSVs have been removed. The `source_csv` annotation in
+each JSON records the original conversion source for provenance. Other devices,
 including `4shank16` without the `intan` suffix, still use CSV geometry, with the
 previous generic 6 µm-radius circular contacts for direct sorting. The older
 `4shank16.json` is a Kilosort map, not ProbeInterface, and is not loaded as one.

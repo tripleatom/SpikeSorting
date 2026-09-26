@@ -1,8 +1,8 @@
 """
-Daily pipeline GUI:  DIO gaps  ->  NWB  ->  MountainSort5
-=========================================================
+Daily pipeline GUI:  DIO gaps  ->  NWB  ->  MountainSort5  ->  archive
+======================================================================
 
-One window for the three steps that get run on every day's recording:
+One window for the steps that get run on every day's recording:
 
   Step 1  rec2nwb/trodes_dio_gui.py    ``trodesexport -dio`` on every .rec file;
                                        writes the ``<recfile>.rec.txt`` gap
@@ -11,12 +11,16 @@ One window for the three steps that get run on every day's recording:
   Step 2  rec2nwb/rec2nwb_interp.py    process_folder() -> ``<session>sh<N>.nwb``
   Step 3  spikesorting/MsSorting.py    process_from_json() -> sorting results
                                        under ``<sortout>/<animal>/...``
+  Step 4  pipeline_runner.py archive   moves the session to its server folder,
+                                       re-verifies every NWB there, then deletes
+                                       the raw .rec traces (ContinualLearning's
+                                       data_collection/migrate_local_session.py)
 
 Recording folder, animal ID, device type and shank list are entered once and
-shared by all three steps; per-step options live on their own tabs.  Any
+shared by all the steps; per-step options live on their own tabs.  Any
 subset of the steps can be run, in order, from one button.
 
-Steps 2 and 3 run as child processes (pipeline_runner.py) so that a multi-hour
+Steps 2-4 run as child processes (pipeline_runner.py) so that a multi-hour
 sort can be stopped without taking the window down.  Their console output —
 progress bars included — is streamed into the log pane.  They run under the
 interpreter named in "Python (steps 2, 3)", which defaults to this one but can
@@ -78,6 +82,11 @@ LOG_ROOT = REPO_ROOT / "pipeline_logs"
 MAPPING_DIR = REPO_ROOT / "rec2nwb" / "mapping"
 DEVICE_TYPES_PATH = REPO_ROOT / "rec2nwb" / "device_types.json"
 MSSORT_DEFAULTS = REPO_ROOT / "spikesorting" / "MsSortingFiles.json"
+
+# Step 4's copy/verify/delete logic and the local -> server folder mapping live
+# in the ContinualLearning repository, alongside the other data-management
+# scripts; the Archive tab can point elsewhere if it moves.
+DEFAULT_TOOLS_ROOT = Path(r"C:\Users\Windows\ContinualLearning")
 
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -173,6 +182,46 @@ def session_names(data_folder: Path) -> tuple[str, str]:
     return written, read
 
 
+def nwb_incomplete_path(nwb_path: Path) -> Path:
+    return Path(f"{nwb_path}.incomplete")
+
+
+def nwb_conversion_complete(nwb_path: Path) -> bool:
+    """A staged ``.nwb.incomplete`` file always means conversion must rerun."""
+    return nwb_path.is_file() and not nwb_incomplete_path(nwb_path).exists()
+
+
+def archive_destination(data_folder: Path, tools_root: str) -> Path | None:
+    """Server folder step 4 will move *data_folder* to, or None if there is none.
+
+    Resolved by ContinualLearning's server_fallback, exactly as step 4 does, so
+    the check shows the real destination rather than a guess at it.
+    """
+    root = str(Path(tools_root))
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from server_fallback import server_session_folder
+    return server_session_folder(data_folder)
+
+
+def good_electrodes(data_folder: Path, device_type: str, impedance_path: str = "",
+                    server_folder: Path | None = None) -> dict:
+    """``{shank: good electrode count}`` as step 2 selects them; 0 means dead.
+
+    Reads bad_channels.txt from *server_folder* when an interrupted step 4 has
+    already moved it there, as step 4 itself does.
+    """
+    import pandas as pd
+    from rec2nwb.utils.electrode import good_electrode_counts
+    from rec2nwb.utils.file_io import load_bad_ch
+    bad_file = data_folder / "bad_channels.txt"
+    if not bad_file.is_file() and server_folder is not None \
+            and (server_folder / "bad_channels.txt").is_file():
+        bad_file = server_folder / "bad_channels.txt"
+    table = pd.read_csv(impedance_path) if impedance_path else None
+    return good_electrode_counts(device_type, load_bad_ch(bad_file), table)
+
+
 # ---------------------------------------------------------------------------
 # Worker: run the enabled steps in order
 # ---------------------------------------------------------------------------
@@ -228,6 +277,9 @@ class PipelineWorker(threading.Thread):
             ("Trodes DIO -> gap .txt", self._step_dio, self.cfg["do_dio"]),
             ("rec -> NWB", self._step_nwb, self.cfg["do_nwb"]),
             ("MountainSort5", self._step_sort, self.cfg["do_sort"]),
+            # Last, and only reached if every step before it succeeded: it
+            # empties the recording folder that sorting reads the NWBs from.
+            ("Archive to server", self._step_archive, self.cfg["do_archive"]),
         ) if enabled]
 
         ok = True
@@ -413,7 +465,8 @@ class PipelineWorker(threading.Thread):
 
         if self.cfg["nwb_skip_existing"]:
             missing = [s for s in shanks
-                       if not (folder / f"{nwb_stem}sh{s}.nwb").exists()]
+                       if not nwb_conversion_complete(
+                           folder / f"{nwb_stem}sh{s}.nwb")]
             done = [s for s in shanks if s not in missing]
             if done:
                 self._log(f"Already converted, skipping shank(s): "
@@ -459,6 +512,21 @@ class PipelineWorker(threading.Thread):
         }
         self._log(f"Results -> {Path(self.cfg['sortout']) / self.cfg['animal_id']}")
         return self._run_child("mssort", config, "mssort_config.json")
+
+    # -- step 4: archive to the server ----------------------------------------
+
+    def _step_archive(self) -> bool:
+        config = {
+            "data_folder": self.cfg["data_folder"],
+            "device_type": self.cfg["device_type"],
+            "impedance_path": self.cfg["impedance_path"] or None,
+            "tools_root": self.cfg["archive_tools_root"],
+            "delete_raw": self.cfg["archive_delete_raw"],
+        }
+        self._log("Moving the session to the server; " + (
+            "the raw .rec traces are deleted once every NWB re-verifies there."
+            if config["delete_raw"] else "the raw .rec traces are kept."))
+        return self._run_child("archive", config, "archive_config.json")
 
 
 # ---------------------------------------------------------------------------
@@ -555,6 +623,9 @@ class App(tk.Tk):
         self.nwb_check.pack(side="left", padx=(0, 16))
         ttk.Checkbutton(steps, text="3. MountainSort5",
                         variable=self.do_sort_var).pack(side="left", padx=(0, 16))
+        self.do_archive_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(steps, text="4. Archive to server",
+                        variable=self.do_archive_var).pack(side="left", padx=(0, 16))
         self.notify_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(steps, text="Pop up when finished",
                         variable=self.notify_var).pack(side="right")
@@ -565,6 +636,7 @@ class App(tk.Tk):
         nb.add(self._build_dio_tab(nb), text="1. DIO")
         nb.add(self._build_nwb_tab(nb), text="2. NWB")
         nb.add(self._build_sort_tab(nb), text="3. Sorting")
+        nb.add(self._build_archive_tab(nb), text="4. Archive")
 
         # --- Actions / status ---
         act = ttk.Frame(root)
@@ -658,7 +730,7 @@ class App(tk.Tk):
                         variable=self.parallel_var).pack(side="left")
 
         self.nwb_skip_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(f, text="Skip shanks whose .nwb file already exists",
+        ttk.Checkbutton(f, text="Skip shanks whose .nwb conversion is complete",
                         variable=self.nwb_skip_var).grid(
             row=4, column=0, columnspan=3, sticky="w", **pad)
         ttk.Label(f, foreground="#555", text=(
@@ -707,6 +779,32 @@ class App(tk.Tk):
             row=1, column=0, sticky="w", pady=(4, 0))
         return f
 
+    def _build_archive_tab(self, parent) -> ttk.Frame:
+        pad = dict(padx=6, pady=4)
+        f = ttk.Frame(parent, padding=8)
+        f.columnconfigure(1, weight=1)
+
+        ttk.Label(f, text="ContinualLearning folder *:").grid(row=0, column=0, sticky="w", **pad)
+        self.tools_root_var = tk.StringVar(value=str(DEFAULT_TOOLS_ROOT))
+        ttk.Entry(f, textvariable=self.tools_root_var).grid(row=0, column=1, sticky="ew", **pad)
+        ttk.Button(f, text="Browse...", command=self._browse_tools_root).grid(
+            row=0, column=2, **pad)
+
+        self.archive_delete_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(f, text="Delete the raw .rec traces once every NWB re-verifies "
+                               "on the server",
+                        variable=self.archive_delete_var).grid(
+            row=1, column=0, columnspan=3, sticky="w", **pad)
+        ttk.Label(f, foreground="#555", text=(
+            "Moves the recording folder to its server folder (the same one the sleep "
+            "pipeline reads from)\nand re-reads every NWB there before deleting any raw "
+            "trace. The .DIO, .timestampoffset,\nparams.json and gap .txt files are "
+            "kept. A shank may lack an NWB only if every one of its\nchannels is in "
+            "bad_channels.txt; otherwise the step refuses and nothing is deleted.\n"
+            "Runs last, after sorting, because it empties the folder sorting reads from.")
+        ).grid(row=2, column=0, columnspan=3, sticky="w", **pad)
+        return f
+
     # -- Field helpers ------------------------------------------------------
 
     def _browse_folder(self):
@@ -742,6 +840,11 @@ class App(tk.Tk):
         d = filedialog.askdirectory(title="Select the sorting output folder")
         if d:
             self.sortout_var.set(str(Path(d)))
+
+    def _browse_tools_root(self):
+        d = filedialog.askdirectory(title="Select the ContinualLearning repository folder")
+        if d:
+            self.tools_root_var.set(str(Path(d)))
 
     def _autofill_from_folder(self):
         folder = Path(self.folder_var.get().strip().strip('"'))
@@ -837,8 +940,12 @@ class App(tk.Tk):
 
         device_type = self.device_var.get().strip()
         do_nwb, do_sort = self.do_nwb_var.get(), self.do_sort_var.get()
+        do_archive = self.do_archive_var.get()
         if (do_nwb or (do_sort and self.direct_sort_var.get())) and not device_type:
             raise ValueError("Device type is required for steps 2 and direct_sort.")
+        if do_archive and not device_type:
+            raise ValueError("Device type is required for step 4: it decides which shanks "
+                             "must have an NWB before any raw data is deleted.")
         if device_type and device_type not in list_device_types():
             raise ValueError(f"No channel map for device type {device_type!r}:\n"
                              f"{MAPPING_DIR} (CSV or ProbeInterface JSON)")
@@ -876,8 +983,15 @@ class App(tk.Tk):
             raise ValueError("Sorting output folder (sortout) is empty.")
 
         python_exe = self.python_var.get().strip().strip('"')
-        if (do_nwb or do_sort) and not Path(python_exe).exists():
+        if (do_nwb or do_sort or do_archive) and not Path(python_exe).exists():
             raise ValueError(f"Python interpreter not found:\n{python_exe}")
+
+        tools_root = self.tools_root_var.get().strip().strip('"')
+        if do_archive:
+            for need in ("data_collection/migrate_local_session.py", "server_fallback.py"):
+                if not (Path(tools_root) / need).is_file():
+                    raise ValueError(f"{need} not found under the ContinualLearning folder "
+                                     f"(Archive tab):\n{tools_root}")
 
         try:
             sorter_params = json.loads(self.params_text.get("1.0", "end").strip() or "{}")
@@ -893,6 +1007,9 @@ class App(tk.Tk):
             "do_dio": self.do_dio_var.get(),
             "do_nwb": do_nwb,
             "do_sort": do_sort,
+            "do_archive": do_archive,
+            "archive_tools_root": tools_root,
+            "archive_delete_raw": self.archive_delete_var.get(),
             "trodes_exe": self.exe_var.get().strip().strip('"'),
             "dio_interp": interp,
             "dio_existing": "skip" if self.dio_existing_var.get() == "skip" else "overwrite",
@@ -928,9 +1045,13 @@ class App(tk.Tk):
                   f"   shanks: {cfg['shanks']}")
         errors = 0
 
+        needed = []
         if cfg["do_nwb"] or cfg["do_sort"]:
-            needed = ["spikeinterface", "pynwb"] + (["mountainsort5"] if cfg["do_sort"] else [])
-            missing = missing_modules(cfg["python"], needed)
+            needed += ["spikeinterface", "pynwb"] + (["mountainsort5"] if cfg["do_sort"] else [])
+        if cfg["do_archive"]:
+            needed += ["h5py", "pandas"]
+        if needed:
+            missing = missing_modules(cfg["python"], list(dict.fromkeys(needed)))
             if missing is None:
                 self._log(f"[ERROR] could not run {cfg['python']}", "err")
                 errors += 1
@@ -960,10 +1081,16 @@ class App(tk.Tk):
                 errors += 1
 
         nwb_stem, sort_stem = session_names(folder)
-        existing = [s for s in cfg["shanks"] if (folder / f"{nwb_stem}sh{s}.nwb").exists()]
+        existing = [s for s in cfg["shanks"] if nwb_conversion_complete(
+            folder / f"{nwb_stem}sh{s}.nwb")]
+        incomplete = [s for s in cfg["shanks"] if nwb_incomplete_path(
+            folder / f"{nwb_stem}sh{s}.nwb").exists()]
         if cfg["do_nwb"]:
             self._log(f"[ok] step 2 writes {nwb_stem}sh<N>.nwb in the recording folder", "ok")
             self._log(f"[ok] electrode location: {cfg['electrode_location']}", "ok")
+            if incomplete:
+                self._log(f"[warn] incomplete conversion found for shank(s) {incomplete} "
+                          f"— they will be redone.", "warn")
             if existing:
                 what = ("skipped" if cfg["nwb_skip_existing"] else "OVERWRITTEN")
                 self._log(f"[warn] shank(s) {existing} already converted — will be {what}.",
@@ -1003,9 +1130,66 @@ class App(tk.Tk):
         found = "found" if bad_ch.exists() else "none (all channels used)"
         self._log(f"[ok] bad_channels.txt: {found}", "ok")
 
+        if cfg["do_archive"]:
+            errors += self._preflight_archive(cfg, folder)
+
         self._log(f"--- {errors} problem(s) found ---" if errors
                   else "--- ready to run ---", "err" if errors else "ok")
         return errors == 0
+
+    def _preflight_archive(self, cfg: dict, folder: Path) -> int:
+        """Log where step 4 will move the session and what it will keep. Returns errors."""
+        errors = 0
+        try:
+            dest = archive_destination(folder, cfg["archive_tools_root"])
+        except Exception as e:  # noqa: BLE001 - report, don't crash the check
+            self._log(f"[ERROR] step 4: cannot resolve the server folder: {e}", "err")
+            return 1
+        if dest is None:
+            self._log(f"[ERROR] step 4: no animal folder on the server matches "
+                      f"'{folder.name}' - add it to SESSION_SERVER_FOLDERS in "
+                      f"server_fallback.py", "err")
+            errors += 1
+        else:
+            self._log(f"[ok] step 4 moves it to {dest}", "ok")
+
+        try:
+            counts = good_electrodes(folder, cfg["device_type"], cfg["impedance_path"], dest)
+        except Exception as e:  # noqa: BLE001 - step 4 works this out again itself
+            self._log(f"[warn] could not count good electrodes here ({e}); step 4 will "
+                      f"work out the dead shanks itself.", "warn")
+        else:
+            dead = [s for s, n in sorted(counts.items()) if n == 0]
+            if dead:
+                self._log(f"[ok] dead shank(s) {dead}: every channel is in "
+                          f"bad_channels.txt, so no NWB is expected for them", "ok")
+            needs = [s for s, n in sorted(counts.items()) if n > 0]
+            self._log(f"[ok] step 4 requires a verified NWB for shank(s) {needs}", "ok")
+            # With step 2 on, it writes them first; with it off they must exist
+            # already, locally or (after an interrupted run) on the server.
+            if not cfg["do_nwb"]:
+                nwb_stem, _ = session_names(folder)
+                missing = [s for s in needs
+                           if not nwb_conversion_complete(
+                               folder / f"{nwb_stem}sh{s}.nwb")
+                           and not (dest is not None
+                                    and nwb_conversion_complete(
+                                        dest / f"{nwb_stem}sh{s}.nwb"))]
+                if missing:
+                    self._log(f"[ERROR] no NWB yet for shank(s) {missing} and step 2 is "
+                              f"off - step 4 would refuse. Is the conversion still "
+                              f"running?", "err")
+                    errors += 1
+
+        if cfg["archive_delete_raw"]:
+            self._log("[warn] step 4 DELETES the raw .rec traces once every NWB "
+                      "re-verifies on the server", "warn")
+        else:
+            self._log("[ok] step 4 keeps the raw .rec traces (delete is off)", "ok")
+        if not cfg["do_sort"]:
+            self._log("[warn] step 3 is off - check this session was already sorted: "
+                      "step 4 empties the folder sorting reads from.", "warn")
+        return errors
 
     # -- Run / stop ---------------------------------------------------------
 
@@ -1015,7 +1199,7 @@ class App(tk.Tk):
         except ValueError as e:
             messagebox.showerror("Check the settings", str(e))
             return
-        if not (cfg["do_dio"] or cfg["do_nwb"] or cfg["do_sort"]):
+        if not (cfg["do_dio"] or cfg["do_nwb"] or cfg["do_sort"] or cfg["do_archive"]):
             messagebox.showerror("Nothing to run", "Select at least one step.")
             return
         if not self._preflight():
@@ -1108,6 +1292,9 @@ class App(tk.Tk):
             "do_dio": self.do_dio_var.get(),
             "do_nwb": self.do_nwb_var.get(),
             "do_sort": self.do_sort_var.get(),
+            "do_archive": self.do_archive_var.get(),
+            "archive_delete": self.archive_delete_var.get(),
+            "tools_root": self.tools_root_var.get(),
             "notify": self.notify_var.get(),
             "exe": self.exe_var.get(),
             "interp": self.interp_var.get(),
@@ -1146,6 +1333,8 @@ class App(tk.Tk):
             ("python", self.python_var), ("remember_device", self.remember_device_var),
             ("do_dio", self.do_dio_var), ("do_nwb", self.do_nwb_var),
             ("do_sort", self.do_sort_var), ("notify", self.notify_var),
+            ("do_archive", self.do_archive_var), ("archive_delete", self.archive_delete_var),
+            ("tools_root", self.tools_root_var),
             ("exe", self.exe_var), ("interp", self.interp_var),
             ("dio_existing", self.dio_existing_var), ("dio_review", self.dio_review_var),
             ("location", self.location_var), ("expdesc", self.expdesc_var),
